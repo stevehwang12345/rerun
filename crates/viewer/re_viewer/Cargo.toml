@@ -53,6 +53,7 @@ perf_telemetry = ["dep:re_perf_telemetry", "re_redap_client/perf_telemetry"]
 ## This only works on native.
 perf_telemetry_tracy = ["perf_telemetry", "re_perf_telemetry/tracy"]
 
+rms_white_label = ["re_blueprint_tree/rms_white_label", "re_recording_panel/rms_white_label", "re_ui/rms_white_label"]
 
 testing = ["dep:tokio", "re_ui/testing", "re_analytics/testing"]
 

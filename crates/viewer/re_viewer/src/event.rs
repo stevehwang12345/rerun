@@ -14,6 +14,7 @@ use re_entity_db::EntityDb;
 use re_log_channel::LogSource;
 use re_log_types::{ApplicationId, RecordingId, TimeReal, Timeline, TimelineName};
 use re_sdk_types::SegmentId;
+use re_sdk_types::blueprint::components::PanelState;
 use re_viewer_context::{ContainerId, Item, ItemCollection, ItemContext, ViewId};
 use re_viewport_blueprint::ViewportBlueprint;
 
@@ -91,6 +92,15 @@ pub enum ViewerEventKind {
     /// entity in a 2D or 3D view.
     SelectionChange { items: Vec<SelectionChangeItem> },
 
+    /// Fired when the hovered item collection changes.
+    HoveredEntityChanged { items: Vec<SelectionChangeItem> },
+
+    /// Fired when a top-level viewer panel changes state.
+    PanelStateChanged {
+        panel: ViewerPanel,
+        state: ViewerPanelState,
+    },
+
     /// Fired when a new recording is opened in the Viewer.
     ///
     /// For `rrd` file or stream, a recording is considered "open" after
@@ -151,6 +161,33 @@ pub enum SelectionChangeItem {
         container_id: ContainerId,
         container_name: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerPanel {
+    Top,
+    Blueprint,
+    Selection,
+    Time,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerPanelState {
+    Hidden,
+    Collapsed,
+    Expanded,
+}
+
+impl From<PanelState> for ViewerPanelState {
+    fn from(value: PanelState) -> Self {
+        match value {
+            PanelState::Hidden => Self::Hidden,
+            PanelState::Collapsed => Self::Collapsed,
+            PanelState::Expanded => Self::Expanded,
+        }
+    }
 }
 
 fn get_position(context: Option<&ItemContext>) -> Option<glam::Vec3> {
@@ -282,6 +319,37 @@ impl ViewerEventDispatcher {
                         SelectionChangeItem::new(item, ctx.as_ref(), viewport_blueprint)
                     })
                     .collect(),
+            },
+        ));
+    }
+
+    #[inline]
+    pub fn on_hovered_entity_change(
+        &self,
+        db: &EntityDb,
+        items: &ItemCollection,
+        viewport_blueprint: &ViewportBlueprint,
+    ) {
+        self.dispatch(ViewerEvent::from_db_and_kind(
+            db,
+            ViewerEventKind::HoveredEntityChanged {
+                items: items
+                    .iter()
+                    .filter_map(|(item, ctx)| {
+                        SelectionChangeItem::new(item, ctx.as_ref(), viewport_blueprint)
+                    })
+                    .collect(),
+            },
+        ));
+    }
+
+    #[inline]
+    pub fn on_panel_state_change(&self, db: &EntityDb, panel: ViewerPanel, state: PanelState) {
+        self.dispatch(ViewerEvent::from_db_and_kind(
+            db,
+            ViewerEventKind::PanelStateChanged {
+                panel,
+                state: state.into(),
             },
         ));
     }

@@ -143,6 +143,25 @@ class SelectionChangeEvent(ViewerEventBase):
 
 
 @dataclass
+class HoveredEntityChangedEvent(ViewerEventBase):
+    @property
+    def type(self) -> Literal["hovered_entity_changed"]:
+        return "hovered_entity_changed"
+
+    items: list[SelectionItem]
+
+
+@dataclass
+class PanelStateChangedEvent(ViewerEventBase):
+    @property
+    def type(self) -> Literal["panel_state_changed"]:
+        return "panel_state_changed"
+
+    panel: Literal["top", "blueprint", "selection", "time"]
+    state: Literal["hidden", "collapsed", "expanded"]
+
+
+@dataclass
 class RecordingOpenEvent(ViewerEventBase):
     """Event triggered when a recording is opened in the viewer."""
 
@@ -157,7 +176,16 @@ class RecordingOpenEvent(ViewerEventBase):
     """The version of the recording, if available."""
 
 
-ViewerEvent = PlayEvent | PauseEvent | TimeUpdateEvent | TimelineChangeEvent | SelectionChangeEvent | RecordingOpenEvent
+ViewerEvent = (
+    PlayEvent
+    | PauseEvent
+    | TimeUpdateEvent
+    | TimelineChangeEvent
+    | SelectionChangeEvent
+    | HoveredEntityChangedEvent
+    | PanelStateChangedEvent
+    | RecordingOpenEvent
+)
 """Union type for all possible viewer event types."""
 
 
@@ -192,7 +220,7 @@ def _viewer_event_from_json_str(json_str: str) -> ViewerEvent:
             time=data["time"],
         )
 
-    elif event_type == "selection_change":
+    elif event_type == "selection_change" or event_type == "hovered_entity_changed":
         items: list[SelectionItem] = []
         for item in data["items"]:
             if item["type"] == "entity":
@@ -219,11 +247,28 @@ def _viewer_event_from_json_str(json_str: str) -> ViewerEvent:
                     )
                 )
 
-        return SelectionChangeEvent(
+        if event_type == "selection_change":
+            return SelectionChangeEvent(
+                application_id=app_id,
+                recording_id=recording_id,
+                segment_id=segment_id,
+                items=items,
+            )
+
+        return HoveredEntityChangedEvent(
             application_id=app_id,
             recording_id=recording_id,
             segment_id=segment_id,
             items=items,
+        )
+
+    elif event_type == "panel_state_changed":
+        return PanelStateChangedEvent(
+            application_id=app_id,
+            recording_id=recording_id,
+            segment_id=segment_id,
+            panel=data["panel"],
+            state=data["state"],
         )
 
     elif event_type == "recording_open":

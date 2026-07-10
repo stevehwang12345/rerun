@@ -1,11 +1,23 @@
 use re_ui::DesignTokens;
 
 pub(super) const DOCS_URL: &str = "https://www.rerun.io/docs";
+
+#[cfg(not(feature = "rms_white_label"))]
 pub(super) const WELCOME_SCREEN_TITLE: &str = "The data layer for physical AI";
+#[cfg(feature = "rms_white_label")]
+pub(super) const WELCOME_SCREEN_TITLE: &str = "Robotics data operations";
+
+#[cfg(not(feature = "rms_white_label"))]
 pub(super) const WELCOME_SCREEN_BULLET_TEXT: &[&str] = &[
     "Log multi-rate, multimodal data with the Rerun SDK in C++, Python, or Rust",
     "Visualize and explore live or recorded data across the pipeline",
     "Query with dataframes or SQL, and stream directly to training",
+];
+#[cfg(feature = "rms_white_label")]
+pub(super) const WELCOME_SCREEN_BULLET_TEXT: &[&str] = &[
+    "Open recorded or live robot telemetry streams",
+    "Visualize multimodal autonomy data across the pipeline",
+    "Inspect missions, perception, planning, and control state",
 ];
 
 /// Show the welcome section.

@@ -1,9 +1,12 @@
 #![cfg(feature = "testing")]
 
+#[cfg(not(feature = "rms_white_label"))]
 use std::time::Duration;
 
 use egui::accesskit::Role;
+#[cfg(not(feature = "rms_white_label"))]
 use egui::os::OperatingSystem;
+#[cfg(not(feature = "rms_white_label"))]
 use egui_kittest::SnapshotResults;
 use egui_kittest::kittest::Queryable as _;
 use re_sdk_types::ColormapSelection;
@@ -12,6 +15,7 @@ use re_test_context::TestContext;
 use re_viewer::viewer_test_utils::{self, HarnessOptions};
 use re_viewer_context::MaybeMutRef;
 
+#[cfg(not(feature = "rms_white_label"))]
 fn os_snapshot_suffix(os: OperatingSystem) -> &'static str {
     match os {
         OperatingSystem::Nix => "linux",
@@ -24,6 +28,7 @@ fn os_snapshot_suffix(os: OperatingSystem) -> &'static str {
 }
 
 /// Navigates from welcome to settings screen and snapshots it.
+#[cfg(not(feature = "rms_white_label"))]
 #[tokio::test]
 async fn settings_screen() {
     #![expect(unsafe_code)] // It's only a test
@@ -68,6 +73,7 @@ async fn settings_screen() {
 }
 
 /// Snapshots the "About Rerun" menu content with a fixed, realistic `BuildInfo`.
+#[cfg(not(feature = "rms_white_label"))]
 #[test]
 fn about_rerun() {
     let test_context = TestContext::new();
@@ -109,8 +115,50 @@ fn about_rerun() {
     harness.snapshot("about_rerun");
 }
 
+#[cfg(feature = "rms_white_label")]
+#[test]
+fn about_rust_rms() {
+    let test_context = TestContext::new();
+
+    let build_info = re_build_info::BuildInfo {
+        crate_name: "rerun-cli".into(),
+        features: "map_view rms_white_label testing".into(),
+        version: re_build_info::CrateVersion {
+            major: 0,
+            minor: 33,
+            patch: 0,
+            meta: None,
+        },
+        rustc_version: "1.84.0 (9fc6b4312 2025-01-07)".into(),
+        llvm_version: "19.1.5".into(),
+        git_hash: "abc1234deadbeefcafebabe00000000000000".into(),
+        git_branch: "main".into(),
+        is_in_rerun_workspace: true,
+        target_triple: "aarch64-apple-darwin".into(),
+        datetime: "2026-05-25T12:34:56Z".into(),
+        is_debug_build: false,
+    };
+
+    let harness = test_context
+        .setup_kittest_for_rendering_ui([460.0, 260.0])
+        .with_theme(egui::Theme::Light);
+
+    let render_state = None;
+
+    let mut harness = harness.build_ui(|ui| {
+        re_ui::apply_style_and_install_loaders(ui.ctx());
+        egui::containers::menu::menu_style(ui.style_mut());
+        re_viewer::about_rerun_ui(ui, &build_info, render_state.as_ref());
+    });
+
+    harness.run();
+    harness.fit_contents();
+    harness.snapshot("about_rust_rms");
+}
+
 /// Opens the Rerun menu without an active recording and snapshots the app.
 /// Tests that certain recording-related entries are disabled (e.g. save or close recording).
+#[cfg(not(feature = "rms_white_label"))]
 #[tokio::test]
 async fn menu_without_recording() {
     let mut harness = viewer_test_utils::viewer_harness(&HarnessOptions::default());
@@ -119,6 +167,15 @@ async fn menu_without_recording() {
     // Redact the shortcut for quitting as it's platform-dependent.
     harness.mask(harness.get_by_label_contains("Quit").rect());
     harness.snapshot("menu_without_recording");
+}
+
+#[cfg(feature = "rms_white_label")]
+#[tokio::test]
+async fn rms_menu_without_recording() {
+    let mut harness = viewer_test_utils::viewer_harness(&HarnessOptions::default());
+    harness.get_by_label("Rust-RMS").click();
+    harness.run_ok();
+    harness.snapshot("rms_menu_without_recording");
 }
 
 /// Tests the colormap selector UI with snapshot testing.

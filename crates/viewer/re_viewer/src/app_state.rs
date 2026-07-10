@@ -7,21 +7,26 @@ use egui::text_selection::LabelSelectionState;
 use re_chunk_store::LatestAtQuery;
 use re_entity_db::EntityDb;
 use re_log_channel::{LogReceiverSet, LogSource, RecordingOpenBehavior};
-use re_log_types::StoreId;
+use re_log_types::{EntityPath, EntityPathFilter, StoreId};
 use re_redap_browser::RedapServers;
 use re_redap_client::ConnectionRegistryHandle;
+use re_sdk_types::ViewClassIdentifier;
 use re_sdk_types::blueprint::components::{PanelState, PlayState};
+use re_sdk_types::blueprint::views::{MapView, Spatial2DView, Spatial3DView};
+use re_types_core::View as _;
 use re_ui::{ContextExt as _, UiExt as _, WindowFrameConfig};
 use re_viewer_context::open_url::{self, ViewerOpenUrl};
 use re_viewer_context::{
     ActiveStoreContext, AppBlueprintCtx, AppContext, AppOptions, ApplicationSelectionState,
     AsyncRuntimeHandle, AuthContext, BlueprintContext, BlueprintUndoState, CommandSender,
-    ComponentUiRegistry, DragAndDropManager, FallbackProviderRegistry, FocusTarget, Item,
-    ItemCollection, Route, SelectionChange, StorageContext, StoreHub, StoreViewContext,
-    SystemCommand, SystemCommandSender as _, TableStore, TimeControl, TimeControlCommand,
-    ViewClassRegistry, ViewStates, ViewerContext,
+    ComponentUiRegistry, DataResultInteractionAddress, DragAndDropManager,
+    FallbackProviderRegistry, FocusTarget, Item, ItemCollection, RecommendedView, Route,
+    SelectionChange, StorageContext, StoreHub, StoreViewContext, SystemCommand,
+    SystemCommandSender as _, TableStore, TimeControl, TimeControlCommand, ViewClassRegistry,
+    ViewId, ViewStates, ViewerContext,
 };
 use re_viewport::ViewportUi;
+use re_viewport_blueprint::ViewBlueprint;
 use re_viewport_blueprint::ViewportBlueprint;
 use re_viewport_blueprint::ui::add_view_or_container_modal_ui;
 
@@ -39,6 +44,142 @@ pub type TestHookRecordingFn = Box<dyn FnOnce(&ViewerContext<'_>)>;
 
 #[cfg(feature = "testing")]
 pub type TestHookAppFn = Box<dyn FnOnce(&re_viewer_context::AppContext<'_>)>;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RmsBlueprintPreset {
+    id: String,
+    label: String,
+    preferred_view: String,
+    focus_view_name: String,
+    entity_paths: Vec<String>,
+}
+
+impl RmsBlueprintPreset {
+    pub(crate) fn apply_to_viewport(&self, ctx: &ViewerContext<'_>, viewport: &ViewportBlueprint) {
+        let Some(view_class) = self.view_class_identifier() else {
+            re_log::warn!(
+                "Unknown RMS blueprint preset view kind '{}' for preset '{}'",
+                self.preferred_view,
+                self.id
+            );
+            return;
+        };
+        let Some((origin, query_filter)) = self.recommended_view_parts() else {
+            re_log::warn!(
+                "RMS blueprint preset '{}' has no valid entity paths",
+                self.id
+            );
+            return;
+        };
+
+        let display_name = self.display_name();
+        let view_id = self
+            .matching_view_id(viewport, view_class, &origin, &display_name)
+            .unwrap_or_else(|| {
+                let view = ViewBlueprint::new(
+                    view_class,
+                    RecommendedView {
+                        origin: origin.clone(),
+                        query_filter,
+                    },
+                );
+                let view_id = view.id;
+                view.set_display_name(ctx, Some(display_name.clone()));
+                viewport.add_view_at_root(view);
+                view_id
+            });
+
+        if let Some(view) = viewport.view(&view_id) {
+            view.set_display_name(ctx, Some(display_name));
+        }
+
+        send_focus_for_preset(ctx, view_id, origin);
+    }
+
+    fn view_class_identifier(&self) -> Option<ViewClassIdentifier> {
+        match self.preferred_view.as_str() {
+            "map" => Some(MapView::identifier()),
+            "spatial_2d" => Some(Spatial2DView::identifier()),
+            "spatial_3d" | "spatial" => Some(Spatial3DView::identifier()),
+            _ => match self.focus_view_name.to_ascii_lowercase().as_str() {
+                "map" | "ground map" => Some(MapView::identifier()),
+                "2d" | "spatial 2d" => Some(Spatial2DView::identifier()),
+                "3d" | "spatial" | "spatial 3d" => Some(Spatial3DView::identifier()),
+                _ => None,
+            },
+        }
+    }
+
+    fn recommended_view_parts(&self) -> Option<(EntityPath, EntityPathFilter)> {
+        let entity_paths = self
+            .entity_paths
+            .iter()
+            .filter_map(|path| match EntityPath::parse_strict(path) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    re_log::warn!(
+                        "Invalid entity path '{}' in RMS blueprint preset '{}': {err}",
+                        path,
+                        self.id
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let origin = entity_paths.first()?.clone();
+        let mut query_filter = EntityPathFilter::default();
+        for entity_path in &entity_paths {
+            query_filter.add_entity_subtree(entity_path);
+        }
+
+        Some((origin, query_filter))
+    }
+
+    fn matching_view_id(
+        &self,
+        viewport: &ViewportBlueprint,
+        view_class: ViewClassIdentifier,
+        origin: &EntityPath,
+        display_name: &str,
+    ) -> Option<ViewId> {
+        viewport
+            .views
+            .iter()
+            .find(|(_, view)| {
+                view.display_name.as_deref() == Some(display_name)
+                    || (view.class_identifier() == view_class && view.space_origin == *origin)
+            })
+            .map(|(view_id, _)| *view_id)
+    }
+
+    fn display_name(&self) -> String {
+        let focus_view_name = self.focus_view_name.trim();
+        if focus_view_name.is_empty() {
+            self.label.clone()
+        } else {
+            focus_view_name.to_owned()
+        }
+    }
+}
+
+fn send_focus_for_preset(ctx: &ViewerContext<'_>, view_id: ViewId, entity_path: EntityPath) {
+    let item = Item::DataResult(DataResultInteractionAddress::from_entity_path(
+        view_id,
+        entity_path,
+    ));
+    ctx.command_sender()
+        .send_system(SystemCommand::set_selection(
+            ItemCollection::from_items_and_context([(item.clone(), None)]),
+        ));
+    ctx.command_sender()
+        .send_system(SystemCommand::SetFocus(FocusTarget {
+            item,
+            context: None,
+        }));
+    ctx.app_ctx.egui_ctx.request_repaint();
+}
 
 // TODO(#11737): Remove the serde derives since almost everything is skipped.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -66,6 +207,8 @@ pub struct AppState {
     blueprint_tree: re_blueprint_tree::BlueprintTree,
     #[serde(skip)]
     pub(crate) recording_panel: re_recording_panel::RecordingPanel,
+    #[serde(skip)]
+    pub(crate) pending_rms_blueprint_presets: Vec<RmsBlueprintPreset>,
 
     #[serde(skip)]
     welcome_screen: crate::ui::WelcomeScreen,
@@ -145,6 +288,7 @@ impl Default for AppState {
             blueprint_time_panel: re_time_panel::TimePanel::new_blueprint_panel(),
             recording_panel: Default::default(),
             blueprint_tree: Default::default(),
+            pending_rms_blueprint_presets: Default::default(),
             welcome_screen: Default::default(),
             datastore_ui: Default::default(),
             redap_servers: Default::default(),
@@ -194,6 +338,12 @@ impl AppState {
 
     pub fn app_options_mut(&mut self) -> &mut AppOptions {
         &mut self.app_options
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn queue_rms_blueprint_preset(&mut self, preset: RmsBlueprintPreset) {
+        self.pending_rms_blueprint_presets.clear();
+        self.pending_rms_blueprint_presets.push(preset);
     }
 
     // TODO(andreas): Large route-dispatch match, one arm per `Route`.
@@ -348,6 +498,7 @@ impl AppState {
                     blueprint_time_panel,
                     blueprint_tree,
                     redap_servers,
+                    pending_rms_blueprint_presets,
                     view_states,
                     ..
                 } = self;
@@ -460,6 +611,10 @@ impl AppState {
 
                 // Update the viewport. May spawn new views and handle queued requests (like screenshots).
                 viewport_ui.on_frame_start(&ctx);
+
+                for preset in std::mem::take(pending_rms_blueprint_presets) {
+                    preset.apply_to_viewport(&ctx, &viewport_ui.blueprint);
+                }
 
                 let window_frame = if custom_window_frame {
                     WindowFrameConfig::custom(ui.ctx())
@@ -855,6 +1010,7 @@ impl AppState {
         route: &Route,
         viewport_ui: Option<&ViewportUi>,
     ) {
+        let hovered_before = self.selection_state.hovered_items().clone();
         let selection_change = self.selection_state.on_frame_start(
             |item| {
                 if let Item::StoreId(store_id) = item
@@ -893,7 +1049,13 @@ impl AppState {
             route.item(),
         );
 
-        if let SelectionChange::SelectionChanged(selection) = selection_change
+        let selection = match selection_change {
+            SelectionChange::SelectionChanged(selection) => Some(selection.clone()),
+            SelectionChange::NoChange => None,
+        };
+        let hovered_changed = self.selection_state.hovered_items() != &hovered_before;
+
+        if let Some(selection) = selection.as_ref()
             && let Some(event_dispatcher) = event_dispatcher
             && let Some(active_store_context) = active_store_context
             && let Some(viewport_ui) = viewport_ui
@@ -901,6 +1063,18 @@ impl AppState {
             event_dispatcher.on_selection_change(
                 active_store_context.recording,
                 selection,
+                &viewport_ui.blueprint,
+            );
+        }
+
+        if hovered_changed
+            && let Some(event_dispatcher) = event_dispatcher
+            && let Some(active_store_context) = active_store_context
+            && let Some(viewport_ui) = viewport_ui
+        {
+            event_dispatcher.on_hovered_entity_change(
+                active_store_context.recording,
+                self.selection_state.hovered_items(),
                 &viewport_ui.blueprint,
             );
         }

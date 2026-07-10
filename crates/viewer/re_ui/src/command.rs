@@ -18,11 +18,6 @@ impl Default for SetPlaybackSpeed {
     }
 }
 
-/// All the commands we support.
-///
-/// Most are available in the GUI,
-/// some have keyboard shortcuts,
-/// and all are visible in the [`crate::CommandPalette`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum_macros::EnumIter)]
 pub enum UICommand {
     // Listed in the order they show up in the command palette by default!
@@ -135,6 +130,32 @@ pub enum UICommand {
 }
 
 impl UICommand {
+    pub fn is_allowed_by_shell_policy(self) -> bool {
+        #[cfg(feature = "rms_white_label")]
+        if matches!(
+            self,
+            Self::Open
+                | Self::OpenUrl
+                | Self::Import
+                | Self::SaveRecording
+                | Self::SaveRecordingSelection
+                | Self::SaveBlueprint
+                | Self::CloseCurrentRecording
+                | Self::CloseAllEntries
+                | Self::OpenWebsite
+                | Self::OpenWebHelp
+                | Self::OpenRerunDiscord
+                | Self::Share
+                | Self::CopyDirectLink
+                | Self::CopyTimeSelectionLink
+                | Self::AddRedapServer
+        ) {
+            return false;
+        }
+
+        true
+    }
+
     pub fn text(self) -> &'static str {
         self.text_and_tooltip().0
     }
@@ -145,19 +166,37 @@ impl UICommand {
 
     pub fn text_and_tooltip(self) -> (&'static str, &'static str) {
         match self {
+            #[cfg(not(feature = "rms_white_label"))]
             Self::SaveRecording => (
                 "Save recording…",
                 "Save all data to a Rerun data file (.rrd)",
             ),
+            #[cfg(feature = "rms_white_label")]
+            Self::SaveRecording => (
+                "Save recording…",
+                "Save all data to a recording file (.rrd)",
+            ),
 
+            #[cfg(not(feature = "rms_white_label"))]
             Self::SaveRecordingSelection => (
                 "Save current time selection…",
                 "Save data for the current loop selection to a Rerun data file (.rrd)",
             ),
+            #[cfg(feature = "rms_white_label")]
+            Self::SaveRecordingSelection => (
+                "Save current time selection…",
+                "Save data for the current loop selection to a recording file (.rrd)",
+            ),
 
+            #[cfg(not(feature = "rms_white_label"))]
             Self::SaveBlueprint => (
                 "Save blueprint…",
                 "Save the current viewer setup as a Rerun blueprint file (.rbl)",
+            ),
+            #[cfg(feature = "rms_white_label")]
+            Self::SaveBlueprint => (
+                "Save blueprint…",
+                "Save the current viewer setup as a viewer blueprint file (.rbl)",
             ),
 
             Self::Open => (
@@ -198,8 +237,10 @@ impl UICommand {
             ),
             Self::Redo => ("Redo", "Redo the last undone thing"),
 
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), not(feature = "rms_white_label")))]
             Self::Quit => ("Quit", "Close the Rerun Viewer"),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "rms_white_label"))]
+            Self::Quit => ("Quit", "Close the Rust-RMS Viewer"),
 
             Self::OpenWebsite => ("rerun.io", "Visit our homepage"),
             Self::OpenWebHelp => (
@@ -238,9 +279,15 @@ impl UICommand {
                 "Capture profiling data and save them as a .puffin file",
             ),
 
+            #[cfg(not(feature = "rms_white_label"))]
             Self::ToggleDevPanel => (
                 "Toggle dev panel",
                 "View developer stats like RAM usage inside Rerun Viewer",
+            ),
+            #[cfg(feature = "rms_white_label")]
+            Self::ToggleDevPanel => (
+                "Toggle dev panel",
+                "View developer stats like RAM usage inside Rust-RMS Viewer",
             ),
 
             Self::TogglePanelStateOverrides => (
@@ -393,6 +440,10 @@ impl UICommand {
 
     /// All keyboard shortcuts, with the primary first.
     pub fn kb_shortcuts(self, os: OperatingSystem) -> SmallVec<[KeyboardShortcut; 2]> {
+        if !self.is_allowed_by_shell_policy() {
+            return smallvec![];
+        }
+
         fn key(key: Key) -> KeyboardShortcut {
             KeyboardShortcut::new(Modifiers::NONE, key)
         }
@@ -568,6 +619,10 @@ impl UICommand {
         // The fallbacks are there for people who have muscle memory for the other shortcuts.
         self.primary_kb_shortcut(egui_ctx.os())
             .map(|shortcut| egui_ctx.format_shortcut(&shortcut))
+    }
+
+    pub fn is_visible_in_command_palette(self) -> bool {
+        self.is_allowed_by_shell_policy()
     }
 
     pub fn icon(self) -> Option<&'static crate::Icon> {
@@ -842,5 +897,54 @@ fn check_for_clashing_command_shortcuts() {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "rms_white_label")]
+#[test]
+fn rms_shell_policy_blocks_file_url_save_and_share_commands() {
+    let blocked_commands = [
+        UICommand::Open,
+        UICommand::OpenUrl,
+        UICommand::Import,
+        UICommand::SaveRecording,
+        UICommand::SaveRecordingSelection,
+        UICommand::SaveBlueprint,
+        UICommand::CloseCurrentRecording,
+        UICommand::CloseAllEntries,
+        UICommand::OpenWebsite,
+        UICommand::OpenWebHelp,
+        UICommand::OpenRerunDiscord,
+        UICommand::Share,
+        UICommand::CopyDirectLink,
+        UICommand::CopyTimeSelectionLink,
+        UICommand::AddRedapServer,
+    ];
+
+    for command in blocked_commands {
+        assert!(!command.is_allowed_by_shell_policy(), "{command:?}");
+        assert!(!command.is_visible_in_command_palette(), "{command:?}");
+        assert!(command.kb_shortcuts(OperatingSystem::Windows).is_empty());
+    }
+}
+
+#[cfg(feature = "rms_white_label")]
+#[test]
+fn rms_shell_policy_keeps_operational_viewer_commands() {
+    let allowed_commands = [
+        UICommand::ToggleCommandPalette,
+        UICommand::TogglePanelStateOverrides,
+        UICommand::ToggleBlueprintPanel,
+        UICommand::ToggleSelectionPanel,
+        UICommand::ToggleTimePanel,
+        UICommand::PlaybackTogglePlayPause,
+        UICommand::PlaybackStepForward,
+        UICommand::ToggleFullscreen,
+        UICommand::Settings,
+    ];
+
+    for command in allowed_commands {
+        assert!(command.is_allowed_by_shell_policy(), "{command:?}");
+        assert!(command.is_visible_in_command_palette(), "{command:?}");
     }
 }

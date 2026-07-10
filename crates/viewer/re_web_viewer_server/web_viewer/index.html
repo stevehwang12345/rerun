@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- Rerun SDK-bundled web viewer. -->
-<html>
+<html lang="en">
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 
   <!-- Disable zooming: -->
@@ -19,7 +19,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@100;500&display=swap"
       rel="stylesheet"
     />
-    <title>Rerun Viewer</title>
+    <title>Rust-RMS Viewer</title>
     <style>
       html {
         /* Remove touch delay: */
@@ -161,7 +161,7 @@
     <script src="re_viewer.js"></script>
 
     <script>
-      if (window.location.hostname == "app.rerun.io") {
+      if (window.location.hostname === "app.rerun.io") {
         const script = document.createElement("script");
         script.src = "https://fifteen-thirtyeight.rerun.io/script.js";
         script.dataset.site = "QKMCQFTQ";
@@ -215,7 +215,7 @@
       function show_unsupported_browser() {
         show_center_html(`
           <p class="strong">
-              Your browser is too old to run the Rerun Viewer.
+              Your browser is too old to run the Rust-RMS Viewer.
           </p>
           <p>
               The Viewer requires WebAssembly SIMD support, available in:
@@ -237,7 +237,7 @@
       ) {
         show_center_html(`
           <p>
-              Rerun is not yet supported on mobile browsers.
+              Rust-RMS Viewer is not yet supported on mobile browsers.
           </p>
           <p>
               <a class="button" href="#" id="try_anyways">Try anyways</a>
@@ -312,7 +312,7 @@
           var custom_size_header = response.headers.get("rerun-final-length");
           if (custom_size_header != null) {
             content_length = custom_size_header;
-          } else if (response.headers.get("content-encoding") == "gzip") {
+          } else if (response.headers.get("content-encoding") === "gzip") {
             // If the content is gzip encoded, try to get the uncompressed size.
             content_length = response.headers.get(
               "x-goog-meta-uncompressed-size",
@@ -405,13 +405,13 @@
 
         function check_for_panic() {
           if (handle.has_panicked()) {
-            console.error("Rerun has crashed");
+            console.error("Rust-RMS Viewer has crashed");
 
             document.getElementById("the_canvas_id").remove();
 
             show_center_html(`
               <p class="strong">
-                  Rerun has crashed.
+                  Rust-RMS Viewer has crashed.
               </p>
               <pre align="left">${handle.panic_message()}</pre>
               <p>
@@ -419,7 +419,7 @@
               </p>
               <p>
                   Reload the page to try again.<br>
-                  Please consider filing a <a href=https://github.com/rerun-io/rerun/issues/new/>bug report<a>. Thank you!
+                  Please contact the Rust-RMS maintainer with the console details.
               </p>
               ${forceWgpuBackendInfoParagraph}
             `);
@@ -493,7 +493,7 @@
           </p>
           <p>
               Reload the page to try again.<br>
-              Please consider filing a <a href=https://github.com/rerun-io/rerun/issues/new/>bug report<a>. Thank you!
+              Please contact the Rust-RMS maintainer with the console details.
           </p>
           ${forceWgpuBackendInfoParagraph}
         `);

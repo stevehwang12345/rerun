@@ -70,10 +70,14 @@ impl App {
                 store_hub.read_context(&route, &active_time_ctrl);
 
             let blueprint = store_context.as_ref().map(|ctx| ctx.blueprint);
+            let recording = store_context.as_ref().map(|ctx| ctx.recording);
             let blueprint_query = self.state.blueprint_query_for_viewer(blueprint);
+            let event_dispatcher = self.event_dispatcher.clone();
 
             let app_blueprint = AppBlueprint::new(
                 blueprint,
+                recording,
+                event_dispatcher.as_ref(),
                 &blueprint_query,
                 egui_ctx,
                 self.panel_state_overrides_active

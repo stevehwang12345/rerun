@@ -32,6 +32,8 @@ default = []
 ## Enable anonymized telemetry using our analytics SDK.
 analytics = ["dep:re_analytics"]
 
+rms_white_label = []
+
 ## Enable helpers for testing
 testing = ["dep:egui_kittest", "re_analytics/testing"]
 

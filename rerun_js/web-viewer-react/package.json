@@ -43,7 +43,7 @@
     "tsconfig.json"
   ],
   "dependencies": {
-    "@rerun-io/web-viewer": "0.34.1"
+    "@rerun-io/web-viewer": "file:../web-viewer"
   },
   "peerDependencies": {
     "@types/react": "^18.2.33 || ^19.0.0",

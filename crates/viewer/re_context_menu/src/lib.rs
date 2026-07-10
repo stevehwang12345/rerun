@@ -8,14 +8,21 @@ use egui::Popup;
 use re_entity_db::InstancePath;
 use re_log_types::TableId;
 use re_ui::UiExt as _;
+#[cfg(not(feature = "rms_white_label"))]
+use re_viewer_context::Contents;
 use re_viewer_context::{
-    ContainerId, Contents, Item, ItemCollection, ItemContext, SystemCommand,
-    SystemCommandSender as _, ViewId, ViewerContext,
+    ContainerId, Item, ItemCollection, ItemContext, SystemCommand, SystemCommandSender as _,
+    ViewId, ViewerContext,
 };
-use re_viewport_blueprint::{ContainerBlueprint, ViewportBlueprint};
+#[cfg(not(feature = "rms_white_label"))]
+use re_viewport_blueprint::ContainerBlueprint;
+use re_viewport_blueprint::ViewportBlueprint;
+
+// allow: SIZE_OK — upstream Rerun context menu module; RMS action filtering stays localized to reduce merge conflicts.
 
 mod actions;
 pub mod collapse_expand;
+#[cfg(not(feature = "rms_white_label"))]
 mod sub_menu;
 mod visibility_actions;
 
@@ -24,17 +31,28 @@ pub use visibility_actions::{
     set_entity_visibility_in_view,
 };
 
+use actions::CopyEntityPathToClipboard;
+#[cfg(not(feature = "rms_white_label"))]
+use actions::TrackEntity;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::add_container::AddContainerAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::add_entities_to_new_view::AddEntitiesToNewViewAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::add_view::AddViewAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::clone_view::CloneViewAction;
 use actions::collapse_expand_all::CollapseExpandAllAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::move_contents_to_new_container::MoveContentsToNewContainerAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::remove::RemoveAction;
+#[cfg(not(feature = "rms_white_label"))]
 use actions::show_hide::{HideAction, ShowAction};
+#[cfg(not(feature = "rms_white_label"))]
 use actions::show_hide_in_all_views::ShowHideInAllViewsAction;
-use actions::{CopyEntityPathToClipboard, TrackEntity};
 use re_ui::menu::menu_style;
+#[cfg(not(feature = "rms_white_label"))]
 use sub_menu::SubMenu;
 
 /// Controls how [`context_menu_ui_for_item`] should handle the current selection state.
@@ -108,6 +126,7 @@ fn context_menu_ui_for_item_with_context_impl(
                     viewer_context: ctx,
                     viewport_blueprint,
                     selection,
+                    #[cfg(not(feature = "rms_white_label"))]
                     clicked_item: item,
                 };
                 show_context_menu_for_selection(&context_menu_ctx, ui);
@@ -159,24 +178,12 @@ fn context_menu_ui_for_item_with_context_impl(
 fn action_list(
     ctx: &ViewerContext<'_>,
 ) -> &'static Vec<Vec<Box<dyn ContextMenuAction + Sync + Send>>> {
-    use egui_tiles::ContainerKind;
-
     static CONTEXT_MENU_ACTIONS: OnceLock<Vec<Vec<Box<dyn ContextMenuAction + Sync + Send>>>> =
         OnceLock::new();
 
-    static_assertions::const_assert_eq!(ContainerKind::ALL.len(), 4);
-
     CONTEXT_MENU_ACTIONS.get_or_init(|| {
-        vec![
-            vec![
-                Box::new(ShowAction),
-                Box::new(HideAction),
-                Box::new(ShowHideInAllViewsAction::Show),
-                Box::new(ShowHideInAllViewsAction::Hide),
-                Box::new(RemoveAction),
-                Box::new(CopyEntityPathToClipboard),
-                Box::new(TrackEntity),
-            ],
+        let mut actions = vec![
+            selection_action_section(),
             vec![
                 Box::new(actions::ScreenshotAction::CopyScreenshot),
                 Box::new(actions::ScreenshotAction::SaveScreenshot),
@@ -185,44 +192,88 @@ fn action_list(
                 Box::new(CollapseExpandAllAction::ExpandAll),
                 Box::new(CollapseExpandAllAction::CollapseAll),
             ],
-            vec![Box::new(CloneViewAction)],
-            vec![
-                Box::new(SubMenu {
-                    label: "Add container".to_owned(),
-                    actions: vec![
-                        Box::new(AddContainerAction(ContainerKind::Tabs)),
-                        Box::new(AddContainerAction(ContainerKind::Horizontal)),
-                        Box::new(AddContainerAction(ContainerKind::Vertical)),
-                        Box::new(AddContainerAction(ContainerKind::Grid)),
-                    ],
-                }),
-                Box::new(SubMenu {
-                    label: "Add view".to_owned(),
-                    actions: ctx
-                        .view_class_registry()
-                        .iter_registry()
-                        .map(|entry| {
-                            Box::new(AddViewAction {
-                                icon: entry.class.icon(),
-                                id: entry.identifier,
-                            })
-                                as Box<dyn ContextMenuAction + Sync + Send>
-                        })
-                        .collect(),
-                }),
-            ],
-            vec![Box::new(SubMenu {
-                label: "Move to new container".to_owned(),
-                actions: vec![
-                    Box::new(MoveContentsToNewContainerAction(ContainerKind::Tabs)),
-                    Box::new(MoveContentsToNewContainerAction(ContainerKind::Horizontal)),
-                    Box::new(MoveContentsToNewContainerAction(ContainerKind::Vertical)),
-                    Box::new(MoveContentsToNewContainerAction(ContainerKind::Grid)),
-                ],
-            })],
-            vec![Box::new(AddEntitiesToNewViewAction)],
-        ]
+        ];
+        actions.extend(blueprint_mutation_action_sections(ctx));
+        actions
     })
+}
+
+fn selection_action_section() -> Vec<Box<dyn ContextMenuAction + Sync + Send>> {
+    let mut actions: Vec<Box<dyn ContextMenuAction + Sync + Send>> =
+        vec![Box::new(CopyEntityPathToClipboard)];
+    actions.extend(selection_mutation_actions());
+    actions
+}
+
+#[cfg(not(feature = "rms_white_label"))]
+fn selection_mutation_actions() -> Vec<Box<dyn ContextMenuAction + Sync + Send>> {
+    vec![
+        Box::new(ShowAction),
+        Box::new(HideAction),
+        Box::new(ShowHideInAllViewsAction::Show),
+        Box::new(ShowHideInAllViewsAction::Hide),
+        Box::new(RemoveAction),
+        Box::new(TrackEntity),
+    ]
+}
+
+#[cfg(feature = "rms_white_label")]
+fn selection_mutation_actions() -> Vec<Box<dyn ContextMenuAction + Sync + Send>> {
+    Vec::new()
+}
+
+#[cfg(not(feature = "rms_white_label"))]
+fn blueprint_mutation_action_sections(
+    ctx: &ViewerContext<'_>,
+) -> Vec<Vec<Box<dyn ContextMenuAction + Sync + Send>>> {
+    use egui_tiles::ContainerKind;
+
+    static_assertions::const_assert_eq!(ContainerKind::ALL.len(), 4);
+
+    vec![
+        vec![Box::new(CloneViewAction)],
+        vec![
+            Box::new(SubMenu {
+                label: "Add container".to_owned(),
+                actions: vec![
+                    Box::new(AddContainerAction(ContainerKind::Tabs)),
+                    Box::new(AddContainerAction(ContainerKind::Horizontal)),
+                    Box::new(AddContainerAction(ContainerKind::Vertical)),
+                    Box::new(AddContainerAction(ContainerKind::Grid)),
+                ],
+            }),
+            Box::new(SubMenu {
+                label: "Add view".to_owned(),
+                actions: ctx
+                    .view_class_registry()
+                    .iter_registry()
+                    .map(|entry| {
+                        Box::new(AddViewAction {
+                            icon: entry.class.icon(),
+                            id: entry.identifier,
+                        }) as Box<dyn ContextMenuAction + Sync + Send>
+                    })
+                    .collect(),
+            }),
+        ],
+        vec![Box::new(SubMenu {
+            label: "Move to new container".to_owned(),
+            actions: vec![
+                Box::new(MoveContentsToNewContainerAction(ContainerKind::Tabs)),
+                Box::new(MoveContentsToNewContainerAction(ContainerKind::Horizontal)),
+                Box::new(MoveContentsToNewContainerAction(ContainerKind::Vertical)),
+                Box::new(MoveContentsToNewContainerAction(ContainerKind::Grid)),
+            ],
+        })],
+        vec![Box::new(AddEntitiesToNewViewAction)],
+    ]
+}
+
+#[cfg(feature = "rms_white_label")]
+fn blueprint_mutation_action_sections(
+    _ctx: &ViewerContext<'_>,
+) -> Vec<Vec<Box<dyn ContextMenuAction + Sync + Send>>> {
+    Vec::new()
 }
 
 /// Display every action that accepts the provided selection.
@@ -266,6 +317,7 @@ struct ContextMenuContext<'a> {
     viewer_context: &'a ViewerContext<'a>,
     viewport_blueprint: &'a ViewportBlueprint,
     selection: &'a ItemCollection,
+    #[cfg(not(feature = "rms_white_label"))]
     clicked_item: &'a Item,
 }
 
@@ -274,6 +326,7 @@ impl<'a> ContextMenuContext<'a> {
     ///
     /// Valid only for views, containers, and data results. For data results, the parent and
     /// position of the enclosing view is considered.
+    #[cfg(not(feature = "rms_white_label"))]
     pub fn clicked_item_enclosing_container_id_and_position(&self) -> Option<(ContainerId, usize)> {
         let contents = match self.clicked_item {
             Item::View(view_id) => Contents::View(*view_id),
@@ -291,6 +344,7 @@ impl<'a> ContextMenuContext<'a> {
     ///
     /// Valid only for views, containers, and data results. For data results, the parent and
     /// position of the enclosing view is considered.
+    #[cfg(not(feature = "rms_white_label"))]
     pub fn clicked_item_enclosing_container_and_position(
         &self,
     ) -> Option<(&'a ContainerBlueprint, usize)> {

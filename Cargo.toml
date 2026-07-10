@@ -33,6 +33,16 @@ repository = "https://github.com/rerun-io/rerun"
 rust-version = "1.92"
 version = "0.34.1"
 
+[workspace.metadata.rust-rms]
+rms-white-label-root-feature = "re_viewer/rms_white_label"
+rms-white-label-crates = [
+  "re_viewer",
+  "re_ui",
+  "re_recording_panel",
+  "re_blueprint_tree",
+  "re_context_menu",
+]
+
 [workspace.metadata.cargo-shear]
 ignored = [
   # rerun crates

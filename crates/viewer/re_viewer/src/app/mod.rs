@@ -31,6 +31,8 @@ use crate::event::ViewerEventDispatcher;
 use crate::latency_tracker::ServerLatencyTrackers;
 use crate::startup_options::StartupOptions;
 
+// allow: SIZE_OK — upstream App owns cross-cutting viewer runtime state; RMS keeps cfg_attr compatibility local to avoid broad refactors.
+
 mod add_data_source;
 mod command_handling;
 mod logic;
@@ -120,6 +122,7 @@ pub struct App {
     ///
     /// Note that initializing with an "old" `Instant` won't work reliably cross platform
     /// since `Instant`'s counter may start at program start.
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     pub(crate) latest_latency_interest: Option<web_time::Instant>,
 
     /// Measures how long a frame takes to paint
@@ -925,6 +928,17 @@ impl App {
     ) {
         #![allow(clippy::allow_attributes, clippy::needless_continue)] // false positive, depending on target_arch
 
+        if !Self::is_drag_and_drop_allowed_by_shell_policy() {
+            let dropped_files = egui_ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+
+            if !dropped_files.is_empty() {
+                re_log::warn!("Blocked dropped files by Rust-RMS shell policy");
+                egui_ctx.request_repaint();
+            }
+
+            return;
+        }
+
         ui::preview_files_being_dropped(egui_ctx);
 
         let dropped_files = egui_ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
@@ -999,6 +1013,11 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn is_drag_and_drop_allowed_by_shell_policy() -> bool {
+        UICommand::Open.is_allowed_by_shell_policy()
+            || UICommand::Import.is_allowed_by_shell_policy()
     }
 
     #[allow(clippy::allow_attributes, clippy::needless_pass_by_ref_mut)] // False positive on wasm
@@ -1127,6 +1146,17 @@ impl App {
             }
             // Ignore any other screenshot requests
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+
+    #[cfg(feature = "rms_white_label")]
+    #[test]
+    fn rms_shell_policy_blocks_drag_and_drop_file_ingest() {
+        assert!(!App::is_drag_and_drop_allowed_by_shell_policy());
     }
 }
 
@@ -1400,10 +1430,14 @@ impl eframe::App for App {
                 store_hub.read_context(active_route, &active_time_ctrl);
 
             let blueprint = store_context.as_ref().map(|ctx| ctx.blueprint);
+            let recording = store_context.as_ref().map(|ctx| ctx.recording);
             let blueprint_query = self.state.blueprint_query_for_viewer(blueprint);
+            let event_dispatcher = self.event_dispatcher.clone();
 
             let app_blueprint = AppBlueprint::new(
                 blueprint,
+                recording,
+                event_dispatcher.as_ref(),
                 &blueprint_query,
                 ui,
                 self.panel_state_overrides_active
@@ -1431,31 +1465,42 @@ impl eframe::App for App {
             {
                 match cmd {
                     re_ui::CommandPaletteAction::UiCommand(cmd) => {
-                        self.command_sender.send_ui(cmd);
+                        if cmd.is_allowed_by_shell_policy() {
+                            self.command_sender.send_ui(cmd);
+                        } else {
+                            re_log::warn!(
+                                "Blocked UI command by Rust-RMS shell policy: {}",
+                                cmd.text()
+                            );
+                        }
                     }
                     re_ui::CommandPaletteAction::OpenUrl(url_desc) => {
-                        match ViewerOpenUrl::parse_with_options(
-                            &url_desc.url,
-                            &re_data_source::FromUriOptions {
-                                accept_extensionless_http: true,
-                                ..Default::default()
-                            },
-                        ) {
-                            Ok(url) => {
-                                url.open(
-                                    ui,
-                                    &OpenUrlOptions {
-                                        follow: false,
-                                        recording_open_behavior:
-                                            RecordingOpenBehavior::OpenAndSelect,
-                                        show_loader: true,
-                                    },
-                                    &self.command_sender,
-                                );
+                        if re_ui::UICommand::OpenUrl.is_allowed_by_shell_policy() {
+                            match ViewerOpenUrl::parse_with_options(
+                                &url_desc.url,
+                                &re_data_source::FromUriOptions {
+                                    accept_extensionless_http: true,
+                                    ..Default::default()
+                                },
+                            ) {
+                                Ok(url) => {
+                                    url.open(
+                                        ui,
+                                        &OpenUrlOptions {
+                                            follow: false,
+                                            recording_open_behavior:
+                                                RecordingOpenBehavior::OpenAndSelect,
+                                            show_loader: true,
+                                        },
+                                        &self.command_sender,
+                                    );
+                                }
+                                Err(err) => {
+                                    re_log::warn!("{err}");
+                                }
                             }
-                            Err(err) => {
-                                re_log::warn!("{err}");
-                            }
+                        } else {
+                            re_log::warn!("Blocked URL open by Rust-RMS shell policy");
                         }
 
                         // Note that we can't use `ui.open_url(egui::OpenUrl::same_tab(uri))` here because..

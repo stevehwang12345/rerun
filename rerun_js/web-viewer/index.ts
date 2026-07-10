@@ -26,7 +26,7 @@ function has_wasm_simd(): boolean {
 }
 
 const UNSUPPORTED_BROWSER_MESSAGE =
-  "Your browser is too old to run the Rerun Viewer. " +
+  "Your browser is too old to run the Rust-RMS Viewer. " +
   "The Viewer requires WebAssembly SIMD support, available in " +
   "Chrome 91+, Firefox 89+, Safari 16.4+, or any modern Chromium-based browser. " +
   "Please update your browser and try again.";
@@ -160,6 +160,21 @@ export type PanelState = "hidden" | "collapsed" | "expanded";
 export type Backend = "webgpu" | "webgl";
 export type VideoDecoder = "auto" | "prefer_software" | "prefer_hardware";
 
+export type FocusEntityOptions = {
+  viewId?: string;
+  viewName?: string;
+  spaceOrigin?: string;
+  position?: readonly [number, number, number];
+};
+
+export type BlueprintPreset = {
+  id: string;
+  label: string;
+  preferredView: string;
+  focusViewName: string;
+  entityPaths: readonly string[];
+};
+
 export interface LoginOptions {
   /** URL to redirect to after successful OAuth login (e.g. "/signed-in" or "https://example.com/signed-in"). */
   signed_in_url: string;
@@ -286,7 +301,12 @@ export type ViewerEvent =
   | TimeUpdateEvent
   | TimelineChangeEvent
   | SelectionChangeEvent
-  | RecordingOpenEvent;
+  | HoveredEntityChangedEvent
+  | PanelStateChangedEvent
+  | RecordingOpenEvent
+  | RecordingClosedEvent
+  | ActiveViewChangedEvent
+  | BlueprintChangedEvent;
 
 /**
  * Properties available on all {@link ViewerEvent} types.
@@ -340,6 +360,20 @@ export type SelectionChangeEvent = ViewerEventBase & {
   items: SelectionChangeItem[];
 }
 
+export type HoveredEntityChangedEvent = ViewerEventBase & {
+  type: "hovered_entity_changed";
+  items: SelectionChangeItem[];
+}
+
+export type PanelStateChangedEvent = {
+  type: "panel_state_changed";
+  application_id: string;
+  recording_id: string | null;
+  partition_id?: string;
+  panel: Panel;
+  state: PanelState | null;
+}
+
 /**
  * Fired when a new recording is opened in the Viewer.
  *
@@ -366,6 +400,34 @@ export type RecordingOpenEvent = ViewerEventBase & {
    * Uses semver format.
    */
   version?: string;
+}
+
+export type RecordingClosedEvent = {
+  type: "recording_closed";
+  application_id: string;
+  recording_id: string | null;
+  partition_id?: string;
+  source?: string;
+  reason: "close" | "stop";
+}
+
+export type ActiveViewChangedEvent = {
+  type: "active_view_changed";
+  application_id: string;
+  recording_id: string | null;
+  partition_id?: string;
+  entity_path: string;
+  view_id?: string;
+  view_name?: string;
+  position?: readonly [number, number, number];
+}
+
+export type BlueprintChangedEvent = {
+  type: "blueprint_changed";
+  application_id: string;
+  recording_id: string | null;
+  partition_id?: string;
+  preset: BlueprintPreset;
 }
 
 // A bit of TypeScript metaprogramming to automatically produce a
@@ -415,6 +477,17 @@ export type ContainerItem = {
 
 /** A single item in a selection. */
 export type SelectionChangeItem = EntityItem | ViewItem | ContainerItem;
+
+export type ViewerSnapshot = {
+  ready: boolean;
+  active_recording_id: string | null;
+  active_timeline: string | null;
+  current_time: number | null;
+  playing: boolean | null;
+  last_event: ViewerEvent | null;
+  last_selection: SelectionChangeItem[];
+  panel_state_overrides: Partial<Record<Panel, PanelState>>;
+};
 
 interface FullscreenOptions {
   get_state: () => boolean;
@@ -483,6 +556,9 @@ export class WebViewer {
   #state: "ready" | "starting" | "stopped" = "stopped";
   #fullscreen = false;
   #allow_fullscreen = false;
+  #last_event: ViewerEvent | null = null;
+  #last_selection: SelectionChangeItem[] = [];
+  #panel_state_overrides: Partial<Record<Panel, PanelState>> = {};
 
   constructor() {
     injectStyle();
@@ -522,7 +598,7 @@ export class WebViewer {
     this.#loader = document.createElement("div");
     this.#loader.innerHTML = `
       <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background-color: #1c1c1c; font-family: sans-serif; color: white;">
-        <div style="margin-bottom: 16px;">Loading Rerun\u2026</div>
+        <div style="margin-bottom: 16px;">Loading Rust-RMS\u2026</div>
         <div style="width: 200px;">
           <div style="background: #333; border-radius: 4px; height: 6px; overflow: hidden;">
             <div class="rerun-progress-bar" style="background: white; height: 100%; width: 0%; transition: width 0.2s;"></div>
@@ -564,7 +640,7 @@ export class WebViewer {
       WebHandle_class = await load(base_url, on_progress);
     } catch (e) {
       this.#clearLoader();
-      this.#fail("Failed to load rerun", String(e));
+      this.#fail("Failed to load Rust-RMS Viewer", String(e));
       throw e;
     }
     if (this.#state !== "starting") {
@@ -587,6 +663,10 @@ export class WebViewer {
 
       // for JS users, we dispatch the parsed event
       let event: ViewerEvent = JSON.parse(event_json);
+      this.#last_event = event;
+      if (event.type === "selection_change") {
+        this.#last_selection = event.items;
+      }
       this.#dispatch_event(
         event.type as any,
         event,
@@ -630,7 +710,7 @@ export class WebViewer {
 
     function check_for_panic() {
       if (self.#handle?.has_panicked()) {
-        self.#fail("Rerun has crashed.", self.#handle?.panic_message());
+        self.#fail("Rust-RMS Viewer has crashed.", self.#handle?.panic_message());
       } else {
         let delay_ms = 1000;
         setTimeout(check_for_panic, delay_ms);
@@ -769,6 +849,30 @@ export class WebViewer {
     return this.#state === "ready";
   }
 
+  get_viewer_snapshot(): ViewerSnapshot {
+    const active_recording_id = this.#handle?.get_active_recording_id() ?? null;
+    const active_timeline = active_recording_id
+      ? this.#handle?.get_active_timeline(active_recording_id) ?? null
+      : null;
+    const current_time = active_recording_id && active_timeline
+      ? this.#handle?.get_time_for_timeline(active_recording_id, active_timeline) ?? 0
+      : null;
+    const playing = active_recording_id
+      ? this.#handle?.get_playing(active_recording_id) ?? false
+      : null;
+
+    return {
+      ready: this.ready,
+      active_recording_id,
+      active_timeline,
+      current_time,
+      playing,
+      last_event: this.#last_event,
+      last_selection: [...this.#last_selection],
+      panel_state_overrides: { ...this.#panel_state_overrides },
+    };
+  }
+
   /**
    * Open a recording.
    *
@@ -806,12 +910,14 @@ export class WebViewer {
 
     const urls = Array.isArray(rrd) ? rrd : [rrd];
     for (const url of urls) {
+      const recording_id = this.#handle.get_active_recording_id() ?? null;
       try {
         this.#handle.remove_receiver(url);
       } catch (e) {
         this.#fail("Failed to close recording", String(e));
         throw e;
       }
+      this.#dispatch_recording_closed(recording_id, url, "close");
     }
   }
 
@@ -825,6 +931,9 @@ export class WebViewer {
     if (this.#allow_fullscreen && this.#canvas && this.#fullscreen) {
       this.#minimize();
     }
+
+    const recording_id = this.#handle?.get_active_recording_id() ?? null;
+    this.#dispatch_recording_closed(recording_id, undefined, "stop");
 
     this.#state = "stopped";
 
@@ -844,6 +953,26 @@ export class WebViewer {
     this.#loader = null;
     this.#fullscreen = false;
     this.#allow_fullscreen = false;
+  }
+
+  #dispatch_recording_closed(
+    recording_id: string | null,
+    source: string | undefined,
+    reason: RecordingClosedEvent["reason"],
+  ) {
+    if (recording_id === null) {
+      return;
+    }
+
+    const event = {
+      type: "recording_closed",
+      application_id: "web-viewer",
+      recording_id,
+      ...(source !== undefined ? { source } : {}),
+      reason,
+    } satisfies RecordingClosedEvent;
+    this.#last_event = event;
+    this.#dispatch_event("recording_closed", event);
   }
 
   #fail(message: string, error_message?: string) {
@@ -976,6 +1105,22 @@ export class WebViewer {
       this.#fail("Failed to override panel state", String(e));
       throw e;
     }
+
+    if (state == null) {
+      delete this.#panel_state_overrides[panel];
+    } else {
+      this.#panel_state_overrides[panel] = state;
+    }
+
+    const event = {
+      type: "panel_state_changed",
+      application_id: "web-viewer",
+      recording_id: this.#handle.get_active_recording_id() ?? null,
+      panel,
+      state: state ?? null,
+    } satisfies PanelStateChangedEvent;
+    this.#last_event = event;
+    this.#dispatch_event("panel_state_changed", event);
   }
 
   /**
@@ -1122,6 +1267,70 @@ export class WebViewer {
     }
 
     this.#handle.set_active_timeline(recording_id, timeline);
+  }
+
+  focus_entity(entity_path: string, options: FocusEntityOptions = {}) {
+    if (!this.#handle) {
+      throw new Error(
+        `attempted to focus entity ${entity_path} in a stopped web viewer`,
+      );
+    }
+
+    try {
+      this.#handle.focus_entity(entity_path, options);
+    } catch (e) {
+      this.#fail("Failed to focus entity", String(e));
+      throw e;
+    }
+    this.#dispatch_active_view_changed(entity_path, options);
+  }
+
+  #dispatch_active_view_changed(entity_path: string, options: FocusEntityOptions) {
+    if (options.viewId === undefined && options.viewName === undefined) {
+      return;
+    }
+
+    const event = {
+      type: "active_view_changed",
+      application_id: "web-viewer",
+      recording_id: this.#handle?.get_active_recording_id() ?? null,
+      entity_path,
+      ...(options.viewId !== undefined ? { view_id: options.viewId } : {}),
+      ...(options.viewName !== undefined ? { view_name: options.viewName } : {}),
+      ...(options.position !== undefined ? { position: options.position } : {}),
+    } satisfies ActiveViewChangedEvent;
+    this.#last_event = event;
+    this.#dispatch_event("active_view_changed", event);
+  }
+
+  apply_blueprint_preset(preset: BlueprintPreset) {
+    if (!this.#handle) {
+      throw new Error(
+        `attempted to apply blueprint preset ${preset.id} in a stopped web viewer`,
+      );
+    }
+
+    try {
+      this.#handle.apply_blueprint_preset(preset);
+    } catch (e) {
+      this.#fail("Failed to apply blueprint preset", String(e));
+      throw e;
+    }
+
+    const event = {
+      type: "blueprint_changed",
+      application_id: "web-viewer",
+      recording_id: this.#handle.get_active_recording_id() ?? null,
+      preset,
+    } satisfies BlueprintChangedEvent;
+    this.#last_event = event;
+    this.#dispatch_event("blueprint_changed", event);
+
+    const entity_path = preset.entityPaths[0];
+
+    if (entity_path !== undefined) {
+      this.#dispatch_active_view_changed(entity_path, { viewName: preset.focusViewName });
+    }
   }
 
   /**

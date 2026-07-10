@@ -250,6 +250,7 @@ fn commands_that_match(
 
     if query.is_empty() {
         UICommand::iter()
+            .filter(|command| command.is_visible_in_command_palette())
             .map(|command| FuzzyMatch {
                 command: CommandPaletteAction::UiCommand(command),
                 score: 0,
@@ -259,6 +260,7 @@ fn commands_that_match(
     } else {
         let query_lowercase = query.to_lowercase();
         let mut matches: Vec<_> = UICommand::iter()
+            .filter(|command| command.is_visible_in_command_palette())
             .filter_map(|command| {
                 let target_text = command.text();
                 sublime_fuzzy::best_match(&query_lowercase, target_text).map(|fuzzy_match| {
@@ -271,8 +273,9 @@ fn commands_that_match(
             })
             .collect();
 
-        // Add the special open URL command.
-        if let Some(url) = parse_url(query) {
+        if UICommand::OpenUrl.is_allowed_by_shell_policy()
+            && let Some(url) = parse_url(query)
+        {
             matches.push(FuzzyMatch {
                 command: CommandPaletteAction::OpenUrl(url),
                 score: -1,
@@ -307,5 +310,34 @@ fn format_match(
         job.into()
     } else {
         egui::RichText::new(target_text).color(text_color).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandPaletteAction, CommandPaletteUrl, commands_that_match};
+    use crate::UICommand;
+
+    #[cfg(feature = "rms_white_label")]
+    #[test]
+    fn rms_command_palette_omits_blocked_commands_and_url_fallback() {
+        let matches = commands_that_match("open", &|url| {
+            Some(CommandPaletteUrl {
+                url: url.to_owned(),
+                command_text: format!("Open {url}"),
+            })
+        });
+
+        assert!(matches.iter().all(|m| match &m.command {
+            CommandPaletteAction::UiCommand(command) => command.is_allowed_by_shell_policy(),
+            CommandPaletteAction::OpenUrl(_) => false,
+        }));
+
+        assert!(matches.iter().all(|m| !matches!(
+            &m.command,
+            CommandPaletteAction::UiCommand(
+                UICommand::Open | UICommand::OpenUrl | UICommand::Import
+            )
+        )));
     }
 }

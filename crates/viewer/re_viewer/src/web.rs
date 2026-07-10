@@ -10,12 +10,15 @@ use arrow::array::RecordBatch;
 use itertools::Itertools as _;
 use re_log::ResultExt as _;
 use re_log_channel::{LogSender, RecordingOpenBehavior};
-use re_log_types::{TableId, TableMsg};
+use re_log_types::{EntityPath, TableId, TableMsg};
 use re_memory::AccountingAllocator;
 use re_sdk_types::blueprint::components::PlayState;
+use re_sdk_types::external::glam::Vec3;
 use re_viewer_context::{
-    AsyncRuntimeHandle, SystemCommand, SystemCommandSender as _, TimeControlCommand, open_url,
+    AsyncRuntimeHandle, DataResultInteractionAddress, FocusTarget, Item, ItemCollection,
+    ItemContext, SystemCommand, SystemCommandSender as _, TimeControlCommand, ViewId, open_url,
 };
+use re_viewport_blueprint::{ViewBlueprint, ViewportBlueprint};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -582,6 +585,44 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    pub fn focus_entity(&self, entity_path: &str, options: JsValue) -> Result<(), JsValue> {
+        let Some(app) = self.runner.app_mut::<crate::App>() else {
+            return Ok(());
+        };
+
+        let entity_path = EntityPath::parse_strict(entity_path)
+            .map_err(|err| js_sys::TypeError::new(&format!("invalid entity path: {err}")))?;
+        let options = FocusEntityOptions::from_js_value(options)?;
+        let (item, context) = focus_target_parts(&app, entity_path, &options)?;
+
+        app.command_sender.send_system(SystemCommand::set_selection(
+            ItemCollection::from_items_and_context([(item.clone(), context.clone())]),
+        ));
+        app.command_sender
+            .send_system(SystemCommand::SetFocus(FocusTarget { item, context }));
+        app.egui_ctx.request_repaint();
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn apply_blueprint_preset(&self, preset: JsValue) -> Result<(), JsValue> {
+        let Some(mut app) = self.runner.app_mut::<crate::App>() else {
+            return Ok(());
+        };
+
+        let preset: crate::app_state::RmsBlueprintPreset = serde_wasm_bindgen::from_value(preset)
+            .map_err(|err| {
+            js_sys::TypeError::new(&format!("invalid blueprint preset: {err}"))
+        })?;
+
+        app.state.queue_rms_blueprint_preset(preset);
+        app.egui_ctx.request_repaint();
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
     pub fn set_credentials(&self, access_token: &str, email: &str) {
         let Some(mut app) = self.runner.app_mut::<crate::App>() else {
             return;
@@ -598,6 +639,133 @@ impl WebHandle {
         });
         egui_ctx.request_repaint();
     }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct FocusEntityOptions {
+    view_id: Option<String>,
+    view_name: Option<String>,
+    space_origin: Option<String>,
+    position: Option<[f32; 3]>,
+}
+
+impl FocusEntityOptions {
+    fn from_js_value(value: JsValue) -> Result<Self, JsValue> {
+        if value.is_null() || value.is_undefined() {
+            return Ok(Self::default());
+        }
+
+        serde_wasm_bindgen::from_value(value).map_err(|err| {
+            js_sys::TypeError::new(&format!("invalid focus entity options: {err}")).into()
+        })
+    }
+}
+
+fn focus_target_parts(
+    app: &crate::App,
+    entity_path: EntityPath,
+    options: &FocusEntityOptions,
+) -> Result<(Item, Option<ItemContext>), JsValue> {
+    let Some((view_id, view_space_origin)) = resolve_focus_view(app, options)? else {
+        return Ok((Item::from(entity_path), None));
+    };
+
+    let item = Item::DataResult(DataResultInteractionAddress::from_entity_path(
+        view_id,
+        entity_path,
+    ));
+
+    let context = if let Some([x, y, z]) = options.position {
+        let space_3d = match &options.space_origin {
+            Some(space_origin) => EntityPath::parse_strict(space_origin).map_err(|err| {
+                js_sys::TypeError::new(&format!("invalid focus space origin: {err}"))
+            })?,
+            None => view_space_origin.unwrap_or_else(EntityPath::root),
+        };
+
+        Some(ItemContext::ThreeD {
+            space_3d,
+            pos: Some(Vec3::new(x, y, z)),
+            tracked_entity: None,
+            point_in_space_cameras: Vec::new(),
+        })
+    } else {
+        None
+    };
+
+    Ok((item, context))
+}
+
+fn resolve_focus_view(
+    app: &crate::App,
+    options: &FocusEntityOptions,
+) -> Result<Option<(ViewId, Option<EntityPath>)>, JsValue> {
+    let requested_view_id = options.view_id.as_deref().map(parse_view_id).transpose()?;
+
+    let Some(store_hub) = app.store_hub.as_ref() else {
+        return Ok(requested_view_id.map(|view_id| (view_id, None)));
+    };
+    let Some(blueprint_db) = store_hub.active_blueprint_for_route(app.state.navigation.current())
+    else {
+        return Ok(requested_view_id.map(|view_id| (view_id, None)));
+    };
+
+    let blueprint_query = app
+        .state
+        .get_blueprint_query_for_viewer(blueprint_db)
+        .unwrap_or_else(|| {
+            re_chunk_store::LatestAtQuery::latest(re_viewer_context::blueprint_timeline())
+        });
+    let viewport_blueprint = ViewportBlueprint::from_db(blueprint_db, &blueprint_query);
+
+    if let Some(view_id) = requested_view_id {
+        let space_origin = viewport_blueprint
+            .view(&view_id)
+            .map(|view| view.space_origin.clone());
+        return Ok(Some((view_id, space_origin)));
+    }
+
+    let Some(view_name) = options.view_name.as_deref() else {
+        return Ok(None);
+    };
+
+    Ok(viewport_blueprint
+        .views
+        .iter()
+        .find(|(_, view)| focus_view_matches_name(view, view_name))
+        .map(|(view_id, view)| (*view_id, Some(view.space_origin.clone()))))
+}
+
+fn focus_view_matches_name(view: &ViewBlueprint, requested_name: &str) -> bool {
+    let requested_name = requested_name.trim();
+    let display_name = view.display_name_or_default();
+
+    if display_name.as_ref().eq_ignore_ascii_case(requested_name) {
+        return true;
+    }
+
+    let requested_alias = requested_name.to_ascii_lowercase().replace('_', " ");
+    let class_identifier = view.class_identifier();
+    let class_identifier = class_identifier.as_str();
+
+    matches!(
+        (requested_alias.as_str(), class_identifier),
+        ("spatial", "3D")
+            | ("spatial 3d", "3D")
+            | ("3d", "3D")
+            | ("spatial 2d", "2D")
+            | ("2d", "2D")
+            | ("map", "Map")
+            | ("ground", "Map")
+            | ("ground map", "Map")
+    )
+}
+
+fn parse_view_id(view_id: &str) -> Result<ViewId, JsValue> {
+    re_sdk_types::external::uuid::Uuid::try_parse(view_id)
+        .map(ViewId::from)
+        .map_err(|err| js_sys::TypeError::new(&format!("invalid view id: {err}")).into())
 }
 
 /// Best effort attempt at finding a store id based on the recording id.

@@ -116,27 +116,33 @@ fn add_button_ui(
     ui: &mut egui::Ui,
     _recording_panel_data: &RecordingPanelData<'_>,
 ) {
+    let open_allowed = re_ui::UICommand::Open.is_allowed_by_shell_policy();
+    let open_url_allowed = re_ui::UICommand::OpenUrl.is_allowed_by_shell_policy();
+    let add_server_allowed = re_ui::UICommand::AddRedapServer.is_allowed_by_shell_policy();
+
+    if !open_allowed && !open_url_allowed && !add_server_allowed {
+        ui.add_enabled(
+            false,
+            ui.small_icon_button_widget(&re_ui::icons::ADD, "Add…")
+                .on_hover_text("Source intake is controlled by the RMS shell"),
+        );
+        return;
+    }
+
     ui.add(
         ui.small_icon_button_widget(&re_ui::icons::ADD, "Add…")
             .on_hover_text("Open a file or connect to a server")
             .on_menu(|ui| {
-                if re_ui::UICommand::Open
-                    .menu_button_ui(ui, ctx.command_sender())
-                    .clicked()
-                {
-                    ui.close();
-                }
-                if re_ui::UICommand::OpenUrl
-                    .menu_button_ui(ui, ctx.command_sender())
-                    .clicked()
-                {
-                    ui.close();
-                }
-                if re_ui::UICommand::AddRedapServer
-                    .menu_button_ui(ui, ctx.command_sender())
-                    .clicked()
-                {
-                    ui.close();
+                for command in [
+                    re_ui::UICommand::Open,
+                    re_ui::UICommand::OpenUrl,
+                    re_ui::UICommand::AddRedapServer,
+                ] {
+                    if command.is_allowed_by_shell_policy()
+                        && command.menu_button_ui(ui, ctx.command_sender()).clicked()
+                    {
+                        ui.close();
+                    }
                 }
 
                 // Show some nice debugging tools in debug builds.
@@ -252,7 +258,12 @@ fn welcome_item_ui(
         Route::RedapServer(origin) if origin == &*EXAMPLES_ORIGIN
     );
 
-    let title = list_item::LabelContent::header("Welcome to rerun").with_icon(&icons::HOME);
+    let welcome_title = if cfg!(feature = "rms_white_label") {
+        "Welcome to Rust-RMS"
+    } else {
+        "Welcome to rerun"
+    };
+    let title = list_item::LabelContent::header(welcome_title).with_icon(&icons::HOME);
 
     let list_item = ui.list_item().header().selected(selected).active(active);
 

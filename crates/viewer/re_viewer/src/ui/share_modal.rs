@@ -6,6 +6,8 @@ use re_uri::Fragment;
 use re_viewer_context::open_url::ViewerOpenUrl;
 use re_viewer_context::{ItemCollection, Route, StoreHub, TimeControl, ViewerContext};
 
+// allow: SIZE_OK — upstream share modal owns link construction/UI; RMS only marks its hidden entrypoint under white-label mode.
+
 pub struct ShareModal {
     modal: ModalHandler,
 
@@ -65,6 +67,7 @@ impl ShareModal {
     }
 
     /// Button that opens the share popup.
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     pub fn button_ui(
         &mut self,
         ui: &mut egui::Ui,

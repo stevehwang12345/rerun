@@ -7,12 +7,14 @@ use egui::ScrollArea;
 use egui::containers::menu;
 use egui::containers::menu::{MenuButton, MenuConfig};
 use re_ui::menu::menu_style;
-use re_ui::{UICommand, UICommandSender as _, UiExt as _, icons};
+use re_ui::{UICommand, UICommandSender as _, UiExt as _};
 use re_viewer_context::ActiveStoreContext;
 
 use crate::App;
 
 const SPACING: f32 = 12.0;
+
+// allow: SIZE_OK — upstream menu owns product, file, debug, and backend actions; RMS policy stays feature-gated here.
 
 impl App {
     pub fn rerun_menu_button_ui(
@@ -22,13 +24,26 @@ impl App {
         ui: &mut egui::Ui,
     ) {
         let icon_tint = ui.tokens().strong_fg_color;
-        let image = re_ui::icons::RERUN_WORDMARK
-            .as_image()
-            .max_height(12.0)
-            .tint(icon_tint)
-            .alt_text("Menu");
 
-        MenuButton::new((image, icons::DROPDOWN_ARROW.as_image().tint(icon_tint)))
+        #[cfg(feature = "rms_white_label")]
+        let menu_button =
+            MenuButton::new(egui::RichText::new("Rust-RMS").strong().color(icon_tint));
+
+        #[cfg(not(feature = "rms_white_label"))]
+        let menu_button = {
+            let image = re_ui::icons::RERUN_WORDMARK
+                .as_image()
+                .max_height(12.0)
+                .tint(icon_tint)
+                .alt_text("Menu");
+
+            MenuButton::new((
+                image,
+                re_ui::icons::DROPDOWN_ARROW.as_image().tint(icon_tint),
+            ))
+        };
+
+        menu_button
             .config(MenuConfig::new().style(menu_style()))
             .ui(ui, |ui| {
                 ui.set_max_height(ui.content_rect().height());
@@ -73,79 +88,143 @@ impl App {
         render_state: Option<&egui_wgpu::RenderState>,
         _store_context: Option<&ActiveStoreContext<'_>>,
     ) {
+        #[cfg(feature = "rms_white_label")]
+        {
+            self.rms_menu_ui(ui, render_state);
+        }
+
+        #[cfg(not(feature = "rms_white_label"))]
+        {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            // no wrapping: make as wide as needed
+
+            let build_info = self.build_info();
+            ui.menu_button("About", |ui| {
+                about_rerun_ui(ui, build_info, render_state);
+            });
+
+            ui.add_space(SPACING);
+
+            UICommand::Undo.menu_button_ui(ui, &self.command_sender); // TODO(emilk): only enabled if there is something to undo
+            UICommand::Redo.menu_button_ui(ui, &self.command_sender); // TODO(emilk): only enabled if there is something to redo
+
+            UICommand::ToggleCommandPalette.menu_button_ui(ui, &self.command_sender);
+
+            ui.add_space(SPACING);
+
+            UICommand::Open.menu_button_ui(ui, &self.command_sender);
+            UICommand::OpenUrl.menu_button_ui(ui, &self.command_sender);
+            UICommand::AddRedapServer.menu_button_ui(ui, &self.command_sender);
+            UICommand::Import.menu_button_ui(ui, &self.command_sender);
+
+            self.save_buttons_ui(ui, _store_context);
+
+            UICommand::SaveBlueprint.menu_button_ui(ui, &self.command_sender);
+
+            let has_recording = _store_context.is_some();
+            ui.add_enabled_ui(has_recording, |ui| {
+                UICommand::CloseCurrentRecording.menu_button_ui(ui, &self.command_sender);
+            });
+
+            ui.add_space(SPACING);
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // On the web the browser controls the zoom
+                let zoom_factor = ui.zoom_factor();
+                re_ui::menu::align_non_button_menu_items(ui, |ui| {
+                    ui.weak(format!("Current zoom: {:.0}%", zoom_factor * 100.0))
+                        .on_hover_text(
+                            "The UI zoom level on top of the operating system's default value",
+                        );
+                });
+                UICommand::ZoomIn.menu_button_ui(ui, &self.command_sender);
+                UICommand::ZoomOut.menu_button_ui(ui, &self.command_sender);
+                ui.add_enabled_ui(zoom_factor != 1.0, |ui| {
+                    UICommand::ZoomReset.menu_button_ui(ui, &self.command_sender)
+                });
+
+                UICommand::ToggleFullscreen.menu_button_ui(ui, &self.command_sender);
+
+                ui.add_space(SPACING);
+            }
+
+            {
+                UICommand::ResetViewer.menu_button_ui(ui, &self.command_sender);
+
+                #[cfg(not(target_arch = "wasm32"))]
+                UICommand::OpenProfiler.menu_button_ui(ui, &self.command_sender);
+
+                UICommand::ToggleDevPanel.menu_button_ui(ui, &self.command_sender);
+                UICommand::ToggleChunkStoreBrowser.menu_button_ui(ui, &self.command_sender);
+
+                #[cfg(debug_assertions)]
+                UICommand::ToggleEguiDebugPanel.menu_button_ui(ui, &self.command_sender);
+            }
+
+            ui.add_space(SPACING);
+
+            UICommand::Settings.menu_button_ui(ui, &self.command_sender);
+
+            #[cfg(target_arch = "wasm32")]
+            backend_menu_ui(&self.command_sender, ui, render_state);
+
+            #[cfg(debug_assertions)]
+            menu::SubMenuButton::new("Debug")
+                .config(
+                    menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .style(menu_style()),
+                )
+                .ui(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    debug_menu_options_ui(ui, &mut self.state.app_options, &self.command_sender);
+
+                    ui.label("egui debug options:");
+                    ui.weak(format!("pixels_per_point: {:?}", ui.pixels_per_point()));
+                    egui_debug_options_ui(ui);
+                });
+
+            ui.add_space(SPACING);
+
+            UICommand::OpenWebsite.menu_button_ui(ui, &self.command_sender);
+            UICommand::OpenWebHelp.menu_button_ui(ui, &self.command_sender);
+            UICommand::OpenRerunDiscord.menu_button_ui(ui, &self.command_sender);
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.add_space(SPACING);
+                UICommand::Quit.menu_button_ui(ui, &self.command_sender);
+            }
+        }
+    }
+
+    #[cfg(feature = "rms_white_label")]
+    fn rms_menu_ui(&mut self, ui: &mut egui::Ui, render_state: Option<&egui_wgpu::RenderState>) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        // no wrapping: make as wide as needed
 
         let build_info = self.build_info();
-        ui.menu_button("About", |ui| {
+        ui.menu_button("About Rust-RMS", |ui| {
             about_rerun_ui(ui, build_info, render_state);
         });
 
         ui.add_space(SPACING);
 
-        UICommand::Undo.menu_button_ui(ui, &self.command_sender); // TODO(emilk): only enabled if there is something to undo
-        UICommand::Redo.menu_button_ui(ui, &self.command_sender); // TODO(emilk): only enabled if there is something to redo
-
         UICommand::ToggleCommandPalette.menu_button_ui(ui, &self.command_sender);
-
-        ui.add_space(SPACING);
-
-        UICommand::Open.menu_button_ui(ui, &self.command_sender);
-        UICommand::OpenUrl.menu_button_ui(ui, &self.command_sender);
-        UICommand::AddRedapServer.menu_button_ui(ui, &self.command_sender);
-        UICommand::Import.menu_button_ui(ui, &self.command_sender);
-
-        self.save_buttons_ui(ui, _store_context);
-
-        UICommand::SaveBlueprint.menu_button_ui(ui, &self.command_sender);
-
-        let has_recording = _store_context.is_some();
-        ui.add_enabled_ui(has_recording, |ui| {
-            UICommand::CloseCurrentRecording.menu_button_ui(ui, &self.command_sender);
-        });
-
-        ui.add_space(SPACING);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // On the web the browser controls the zoom
-            let zoom_factor = ui.zoom_factor();
-            re_ui::menu::align_non_button_menu_items(ui, |ui| {
-                ui.weak(format!("Current zoom: {:.0}%", zoom_factor * 100.0))
-                    .on_hover_text(
-                        "The UI zoom level on top of the operating system's default value",
-                    );
-            });
-            UICommand::ZoomIn.menu_button_ui(ui, &self.command_sender);
-            UICommand::ZoomOut.menu_button_ui(ui, &self.command_sender);
-            ui.add_enabled_ui(zoom_factor != 1.0, |ui| {
-                UICommand::ZoomReset.menu_button_ui(ui, &self.command_sender)
-            });
-
-            UICommand::ToggleFullscreen.menu_button_ui(ui, &self.command_sender);
-
-            ui.add_space(SPACING);
-        }
-
-        {
-            UICommand::ResetViewer.menu_button_ui(ui, &self.command_sender);
-
-            #[cfg(not(target_arch = "wasm32"))]
-            UICommand::OpenProfiler.menu_button_ui(ui, &self.command_sender);
-
-            UICommand::ToggleDevPanel.menu_button_ui(ui, &self.command_sender);
-            UICommand::ToggleChunkStoreBrowser.menu_button_ui(ui, &self.command_sender);
-
-            #[cfg(debug_assertions)]
-            UICommand::ToggleEguiDebugPanel.menu_button_ui(ui, &self.command_sender);
-        }
-
-        ui.add_space(SPACING);
-
+        UICommand::ResetViewer.menu_button_ui(ui, &self.command_sender);
         UICommand::Settings.menu_button_ui(ui, &self.command_sender);
 
         #[cfg(target_arch = "wasm32")]
         backend_menu_ui(&self.command_sender, ui, render_state);
+
+        ui.add_space(SPACING);
+
+        ui.menu_button("Internal panels", |ui| {
+            UICommand::TogglePanelStateOverrides.menu_button_ui(ui, &self.command_sender);
+            UICommand::ToggleBlueprintPanel.menu_button_ui(ui, &self.command_sender);
+            UICommand::ToggleSelectionPanel.menu_button_ui(ui, &self.command_sender);
+            UICommand::ToggleTimePanel.menu_button_ui(ui, &self.command_sender);
+        });
 
         #[cfg(debug_assertions)]
         menu::SubMenuButton::new("Debug")
@@ -156,6 +235,8 @@ impl App {
             )
             .ui(ui, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                UICommand::ToggleDevPanel.menu_button_ui(ui, &self.command_sender);
+                UICommand::ToggleChunkStoreBrowser.menu_button_ui(ui, &self.command_sender);
                 debug_menu_options_ui(ui, &mut self.state.app_options, &self.command_sender);
 
                 ui.label("egui debug options:");
@@ -164,18 +245,10 @@ impl App {
             });
 
         ui.add_space(SPACING);
-
-        UICommand::OpenWebsite.menu_button_ui(ui, &self.command_sender);
-        UICommand::OpenWebHelp.menu_button_ui(ui, &self.command_sender);
-        UICommand::OpenRerunDiscord.menu_button_ui(ui, &self.command_sender);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            ui.add_space(SPACING);
-            UICommand::Quit.menu_button_ui(ui, &self.command_sender);
-        }
+        ui.weak("File import/export and robot execution commands are controlled by the RMS shell audit gate.");
     }
 
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     fn save_buttons_ui(&self, ui: &mut egui::Ui, store_ctx: Option<&ActiveStoreContext<'_>>) {
         use re_ui::UICommandSender as _;
 
@@ -198,10 +271,20 @@ impl App {
         } else {
             let entity_db_is_nonempty =
                 store_ctx.is_some_and(|ctx| 0 < ctx.recording.num_physical_chunks());
+            let save_recording_tooltip = if cfg!(feature = "rms_white_label") {
+                "Save all data to a recording file (.rrd)"
+            } else {
+                "Save all data to a Rerun data file (.rrd)"
+            };
+            let save_selection_tooltip = if cfg!(feature = "rms_white_label") {
+                "Save data for the current loop selection to a recording file (.rrd)"
+            } else {
+                "Save data for the current loop selection to a Rerun data file (.rrd)"
+            };
             ui.add_enabled_ui(entity_db_is_nonempty, |ui| {
                 if ui
                     .add(save_recording_button)
-                    .on_hover_text("Save all data to a Rerun data file (.rrd)")
+                    .on_hover_text(save_recording_tooltip)
                     .clicked()
                 {
                     ui.close();
@@ -216,9 +299,7 @@ impl App {
 
                 if ui
                     .add_enabled(loop_selection.is_some(), save_selection_button)
-                    .on_hover_text(
-                        "Save data for the current loop selection to a Rerun data file (.rrd)",
-                    )
+                    .on_hover_text(save_selection_tooltip)
                     .clicked()
                 {
                     ui.close();
@@ -255,33 +336,49 @@ pub fn about_rerun_ui(
 
     ui.set_max_width(400.0);
 
-    let logo_size = 68.0;
+    #[cfg(not(feature = "rms_white_label"))]
+    {
+        let logo_size = 68.0;
 
-    ui.horizontal(|ui|{
-        ui.add(
-            re_ui::icons::RERUN_LOGO
-                .as_image()
-                .fit_to_exact_size(egui::Vec2::splat(logo_size))
-                .corner_radius(4.0)
-                .alt_text("Rerun"),
-        );
-
-        ui.vertical(|ui|{
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.label(
-                "Rerun is a toolchain for robotics and physical AI that makes it easy to log, query, visualize, and train on multi-rate, multimodal data.",
+        ui.horizontal(|ui| {
+            ui.add(
+                re_ui::icons::RERUN_LOGO
+                    .as_image()
+                    .fit_to_exact_size(egui::Vec2::splat(logo_size))
+                    .corner_radius(4.0)
+                    .alt_text("Rerun"),
             );
 
-            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.label(
+                    "Rerun is a toolchain for robotics and physical AI that makes it easy to log, query, visualize, and train on multi-rate, multimodal data.",
+                );
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.label("Learn more at ");
-                ui.hyperlink_to("rerun.io", "https://rerun.io/");
-                ui.label(".");
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label("Learn more at ");
+                    ui.hyperlink_to("rerun.io", "https://rerun.io/");
+                    ui.label(".");
+                });
             });
         });
-    });
+    }
+
+    #[cfg(feature = "rms_white_label")]
+    {
+        ui.vertical(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.heading("Rust-RMS Viewer");
+            ui.label(
+                "Robotics operations viewer for autonomy, drone, and robot management workflows.",
+            );
+            ui.add_space(4.0);
+            ui.label("Supports .rrd recordings and live visualization streams.");
+        });
+    }
 
     ui.add_space(SPACING);
 

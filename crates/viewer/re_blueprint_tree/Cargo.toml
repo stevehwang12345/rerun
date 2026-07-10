@@ -20,6 +20,7 @@ all-features = true
 
 [features]
 default = []
+rms_white_label = ["re_context_menu/rms_white_label"]
 testing = ["dep:serde", "smallvec/serde", "re_viewer_context/testing"]
 
 [dependencies]

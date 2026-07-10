@@ -13,6 +13,10 @@ use re_viewer_context::{
     blueprint_timepoint_for_writes,
 };
 
+use crate::event::{ViewerEventDispatcher, ViewerPanel};
+
+// allow: SIZE_OK — upstream blueprint panel state owns store writes and toggles; RMS override guards stay here for merge locality.
+
 const TOP_PANEL_PATH: &str = "top_panel";
 const BLUEPRINT_PANEL_PATH: &str = "blueprint_panel";
 const SELECTION_PANEL_PATH: &str = "selection_panel";
@@ -24,6 +28,8 @@ const FALLBACK_PANEL_STATES_ID: &str = "re_viewer.app_blueprint.fallback_panel_s
 /// Blueprint for top-level application
 pub struct AppBlueprint<'a> {
     blueprint_db: Option<&'a EntityDb>,
+    recording_db: Option<&'a EntityDb>,
+    event_dispatcher: Option<&'a ViewerEventDispatcher>,
     is_narrow_screen: bool,
     panel_states: PanelStates,
     overrides: Option<PanelStateOverrides>,
@@ -69,6 +75,8 @@ impl<'de> serde::Deserialize<'de> for PanelStates {
 impl<'a> AppBlueprint<'a> {
     pub fn new(
         blueprint_db: Option<&'a EntityDb>,
+        recording_db: Option<&'a EntityDb>,
+        event_dispatcher: Option<&'a ViewerEventDispatcher>,
         query: &LatestAtQuery,
         egui_ctx: &egui::Context,
         overrides: Option<PanelStateOverrides>,
@@ -94,6 +102,8 @@ impl<'a> AppBlueprint<'a> {
         };
         let mut ret = Self {
             blueprint_db,
+            recording_db,
+            event_dispatcher,
             is_narrow_screen: screen_size.x < 600.0,
             panel_states: default_panel_states.clone(),
             overrides,
@@ -216,14 +226,17 @@ impl<'a> AppBlueprint<'a> {
         );
     }
 
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     pub fn blueprint_panel_overridden(&self) -> bool {
         self.overrides.is_some_and(|s| s.blueprint.is_some())
     }
 
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     pub fn selection_panel_overridden(&self) -> bool {
         self.overrides.is_some_and(|s| s.selection.is_some())
     }
 
+    #[cfg_attr(feature = "rms_white_label", allow(dead_code))]
     pub fn time_panel_overridden(&self) -> bool {
         self.overrides.is_some_and(|s| s.time.is_some())
     }
@@ -295,6 +308,23 @@ impl AppBlueprint<'_> {
             });
             self.egui_ctx.request_repaint();
         }
+
+        if let Some(panel) = viewer_panel_from_name(panel_name)
+            && let Some(event_dispatcher) = self.event_dispatcher
+            && let Some(recording_db) = self.recording_db
+        {
+            event_dispatcher.on_panel_state_change(recording_db, panel, value);
+        }
+    }
+}
+
+fn viewer_panel_from_name(panel_name: &str) -> Option<ViewerPanel> {
+    match panel_name {
+        TOP_PANEL_PATH => Some(ViewerPanel::Top),
+        BLUEPRINT_PANEL_PATH => Some(ViewerPanel::Blueprint),
+        SELECTION_PANEL_PATH => Some(ViewerPanel::Selection),
+        p if p == TIME_PANEL_PATH => Some(ViewerPanel::Time),
+        _ => None,
     }
 }
 

@@ -1,4 +1,5 @@
 //! Utility to track rtt latency for redap origins.
+#![cfg_attr(feature = "rms_white_label", allow(dead_code))]
 
 use std::sync::Arc;
 

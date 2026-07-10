@@ -1,5 +1,15 @@
 /// Used by `eframe` to decide where to store the app state.
+#[cfg(not(feature = "rms_white_label"))]
 pub const APP_ID: &str = "rerun";
+
+#[cfg(feature = "rms_white_label")]
+pub const APP_ID: &str = "rust-rms-viewer";
+
+#[cfg(not(feature = "rms_white_label"))]
+const WINDOW_TITLE: &str = "Rerun";
+
+#[cfg(feature = "rms_white_label")]
+const WINDOW_TITLE: &str = "Rust-RMS Viewer";
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -21,9 +31,8 @@ pub fn run_native_app(
 
     let native_options = eframe_options(force_wgpu_backend);
 
-    let window_title = "Rerun";
     eframe::run_native(
-        window_title,
+        WINDOW_TITLE,
         native_options,
         Box::new(move |cc| {
             crate::customize_eframe_and_setup_renderer(cc)?;
@@ -42,8 +51,8 @@ pub fn eframe_options(force_wgpu_backend: Option<&str>) -> eframe::NativeOptions
             .with_decorations(!custom_window_decorations) // Maybe hide the OS-specific "chrome" around the window
             .with_fullsize_content_view(re_ui::fullsize_content(os))
             .with_icon(icon_data())
-            .with_inner_size([1600.0, 1200.0])
-            .with_min_inner_size([320.0, 450.0]) // Should be high enough to fit the rerun menu
+            .with_inner_size(default_inner_size())
+            .with_min_inner_size(minimum_inner_size())
             .with_title_shown(!re_ui::fullsize_content(os))
             .with_titlebar_buttons_shown(!custom_window_decorations)
             .with_titlebar_shown(!re_ui::fullsize_content(os))
@@ -58,6 +67,55 @@ pub fn eframe_options(force_wgpu_backend: Option<&str>) -> eframe::NativeOptions
     }
 }
 
+fn default_inner_size() -> [f32; 2] {
+    if cfg!(feature = "rms_white_label") {
+        [1280.0, 860.0]
+    } else {
+        [1600.0, 1200.0]
+    }
+}
+
+fn minimum_inner_size() -> [f32; 2] {
+    if cfg!(feature = "rms_white_label") {
+        [420.0, 360.0]
+    } else {
+        [320.0, 450.0]
+    }
+}
+
+#[cfg(feature = "rms_white_label")]
+fn icon_data() -> egui::IconData {
+    re_tracing::profile_function!();
+
+    const SIZE: u32 = 32;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let border = x < 2 || y < 2 || x >= SIZE - 2 || y >= SIZE - 2;
+            let diagonal = x.abs_diff(y) <= 1 || (SIZE - 1 - x).abs_diff(y) <= 1;
+            let core = (10..22).contains(&x) && (10..22).contains(&y);
+            let color = if border {
+                [15, 23, 42, 255]
+            } else if diagonal {
+                [56, 189, 248, 255]
+            } else if core {
+                [34, 197, 94, 255]
+            } else {
+                [248, 250, 252, 255]
+            };
+            rgba.extend_from_slice(&color);
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
+#[cfg(not(feature = "rms_white_label"))]
 fn icon_data() -> egui::IconData {
     re_tracing::profile_function!();
 

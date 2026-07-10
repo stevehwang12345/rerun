@@ -18,6 +18,9 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+rms_white_label = []
+
 [dependencies]
 re_entity_db.workspace = true
 re_log_types.workspace = true

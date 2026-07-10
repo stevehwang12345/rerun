@@ -757,6 +757,14 @@ impl App {
         route: &Route,
         cmd: UICommand,
     ) {
+        if !cmd.is_allowed_by_shell_policy() {
+            re_log::warn!(
+                "Blocked UI command by Rust-RMS shell policy: {}",
+                cmd.text()
+            );
+            return;
+        }
+
         let mut force_store_info = false;
         let active_store_id = store_context
             .map(|ctx| ctx.recording_store_id().clone())
@@ -988,18 +996,24 @@ impl App {
                 egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
 
+            #[cfg(feature = "rms_white_label")]
+            UICommand::OpenWebsite | UICommand::OpenWebHelp | UICommand::OpenRerunDiscord => {}
+
+            #[cfg(not(feature = "rms_white_label"))]
             UICommand::OpenWebsite => {
                 egui_ctx.open_url(egui::output::OpenUrl {
                     url: "https://rerun.io/".to_owned(),
                     new_tab: true,
                 });
             }
+            #[cfg(not(feature = "rms_white_label"))]
             UICommand::OpenWebHelp => {
                 egui_ctx.open_url(egui::output::OpenUrl {
                     url: "https://rerun.io/docs/getting-started/navigating-the-viewer".to_owned(),
                     new_tab: true,
                 });
             }
+            #[cfg(not(feature = "rms_white_label"))]
             UICommand::OpenRerunDiscord => {
                 egui_ctx.open_url(egui::output::OpenUrl {
                     url: "https://discord.gg/PXtCgFBSmH".to_owned(),

@@ -21,6 +21,24 @@ use crate::data::{
     BlueprintTreeData, ContainerData, ContentsData, DataResultData, DataResultKind, ViewData,
 };
 
+// allow: SIZE_OK — upstream Rerun blueprint tree UI module; RMS read-only patch stays localized to reduce merge conflicts.
+
+#[cfg(not(feature = "rms_white_label"))]
+#[inline]
+fn is_blueprint_tree_editing_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "rms_white_label")]
+#[inline]
+fn is_blueprint_tree_editing_enabled() -> bool {
+    false
+}
+
+fn blueprint_tree_editing_disabled_reason() -> &'static str {
+    "RMS mode manages blueprint structure from the RMS panel"
+}
+
 /// Holds the state of the blueprint tree UI.
 #[derive(Default)]
 pub struct BlueprintTree {
@@ -105,9 +123,20 @@ impl BlueprintTree {
                         &re_ui::icons::MORE,
                         "Open menu with more options",
                         |ui| {
-                            add_new_view_or_container_menu_button(ctx, viewport_blueprint, ui);
-                            set_blueprint_to_default_menu_buttons(ctx, ui);
-                            set_blueprint_to_auto_menu_button(ctx, ui);
+                            if is_blueprint_tree_editing_enabled() {
+                                add_new_view_or_container_menu_button(ctx, viewport_blueprint, ui);
+                                set_blueprint_to_default_menu_buttons(ctx, ui);
+                                set_blueprint_to_auto_menu_button(ctx, ui);
+                            } else {
+                                ui.add_enabled(
+                                    false,
+                                    re_ui::icons::ADD.as_button_with_label(
+                                        ui.tokens(),
+                                        "Blueprint editing locked",
+                                    ),
+                                )
+                                .on_disabled_hover_text(blueprint_tree_editing_disabled_reason());
+                            }
                         },
                     ),
                 );
@@ -176,12 +205,14 @@ impl BlueprintTree {
                     }
 
                     // handle drag and drop interaction on empty space
-                    self.handle_empty_space_drag_and_drop_interaction(
-                        ctx,
-                        viewport_blueprint,
-                        ui,
-                        empty_space_response.rect,
-                    );
+                    if is_blueprint_tree_editing_enabled() {
+                        self.handle_empty_space_drag_and_drop_interaction(
+                            ctx,
+                            viewport_blueprint,
+                            ui,
+                            empty_space_response.rect,
+                        );
+                    }
                 });
             });
     }
@@ -215,7 +246,7 @@ impl BlueprintTree {
             .list_item()
             .render_offscreen(false)
             .selected(ctx.selection().contains_item(&item))
-            .draggable(true) // allowed for consistency but results in an invalid drag
+            .draggable(is_blueprint_tree_editing_enabled())
             .drop_target_style(self.is_candidate_drop_parent_container(&container_data.id))
             .show_flat(
                 ui,
@@ -229,7 +260,7 @@ impl BlueprintTree {
                 .with_buttons(|ui| {
                     // If this has been hidden in a blueprint we want to be
                     // able to make it visible again in the viewer.
-                    if !container_data.visible {
+                    if is_blueprint_tree_editing_enabled() && !container_data.visible {
                         let mut visible_after = container_data.visible;
                         visibility_button_ui(ui, true, &mut visible_after);
                         if visible_after != container_data.visible {
@@ -332,11 +363,13 @@ impl BlueprintTree {
             .label_style(contents_name_style(&container_data.name))
             .with_icon(icon_for_container_kind(&container_data.kind))
             .with_buttons(|ui| {
-                visibility_button_ui(ui, parent_visible, &mut visible);
+                if is_blueprint_tree_editing_enabled() {
+                    visibility_button_ui(ui, parent_visible, &mut visible);
 
-                if remove_button_ui(ui, "Remove container").clicked() {
-                    viewport_blueprint.mark_user_interaction(ctx);
-                    viewport_blueprint.remove_contents(content);
+                    if remove_button_ui(ui, "Remove container").clicked() {
+                        viewport_blueprint.mark_user_interaction(ctx);
+                        viewport_blueprint.remove_contents(content);
+                    }
                 }
             });
 
@@ -352,7 +385,7 @@ impl BlueprintTree {
             .list_item()
             .render_offscreen(false)
             .selected(ctx.selection().contains_item(&item))
-            .draggable(true)
+            .draggable(is_blueprint_tree_editing_enabled())
             .drop_target_style(self.is_candidate_drop_parent_container(&container_data.id))
             .show_hierarchical_with_children(
                 ui,
@@ -374,7 +407,9 @@ impl BlueprintTree {
                 },
             );
 
-        viewport_blueprint.set_content_visibility(ctx, &content, visible);
+        if is_blueprint_tree_editing_enabled() {
+            viewport_blueprint.set_content_visibility(ctx, &content, visible);
+        }
         let response = response.on_hover_text(format!("{:?} container", container_data.kind));
 
         self.handle_interactions_for_item(
@@ -432,11 +467,13 @@ impl BlueprintTree {
             .with_icon(class.icon())
             .subdued(!view_visible)
             .with_buttons(|ui| {
-                visibility_button_ui(ui, container_visible, &mut visible);
+                if is_blueprint_tree_editing_enabled() {
+                    visibility_button_ui(ui, container_visible, &mut visible);
 
-                if remove_button_ui(ui, "Remove view from the viewport").clicked() {
-                    viewport_blueprint.mark_user_interaction(ctx);
-                    viewport_blueprint.remove_contents(Contents::View(view_data.id));
+                    if remove_button_ui(ui, "Remove view from the viewport").clicked() {
+                        viewport_blueprint.mark_user_interaction(ctx);
+                        viewport_blueprint.remove_contents(Contents::View(view_data.id));
+                    }
                 }
             });
 
@@ -452,7 +489,7 @@ impl BlueprintTree {
             .list_item()
             .render_offscreen(false)
             .selected(ctx.selection().contains_item(&item))
-            .draggable(true)
+            .draggable(is_blueprint_tree_editing_enabled())
             .force_hovered(is_item_hovered)
             .show_hierarchical_with_children(ui, id, view_data.default_open, item_content, |ui| {
                 if let Some(data_result_data) = &view_data.origin_tree {
@@ -497,7 +534,9 @@ impl BlueprintTree {
         }
 
         let content = Contents::View(view_data.id);
-        viewport_blueprint.set_content_visibility(ctx, &content, visible);
+        if is_blueprint_tree_editing_enabled() {
+            viewport_blueprint.set_content_visibility(ctx, &content, visible);
+        }
 
         self.handle_interactions_for_item(
             ctx,
@@ -578,9 +617,11 @@ impl BlueprintTree {
                 if is_empty_origin_placeholder {
                     item_content.subdued(true)
                 } else {
-                    item_content
-                        .subdued(!view_visible || !data_result_data.visible)
-                        .with_buttons(|ui: &mut egui::Ui| {
+                    let item_content =
+                        item_content.subdued(!view_visible || !data_result_data.visible);
+
+                    if is_blueprint_tree_editing_enabled() {
+                        item_content.with_buttons(|ui: &mut egui::Ui| {
                             let mut visible_after = data_result_data.visible;
                             visibility_button_ui(ui, view_visible, &mut visible_after);
                             if visible_after != data_result_data.visible {
@@ -597,6 +638,9 @@ impl BlueprintTree {
                                     .remove_data_result_from_view(ctx, viewport_blueprint);
                             }
                         })
+                    } else {
+                        item_content
+                    }
                 }
             }
 
@@ -632,7 +676,7 @@ impl BlueprintTree {
         let list_item = ui
             .list_item()
             .render_offscreen(false)
-            .draggable(true)
+            .draggable(is_blueprint_tree_editing_enabled())
             .selected(is_selected)
             .force_hovered(is_item_hovered);
 
@@ -724,7 +768,11 @@ impl BlueprintTree {
             SelectionUpdateBehavior::UseSelection,
         );
         self.scroll_to_me_if_needed(ui, item, response);
-        ctx.handle_select_hover_drag_interactions(response, item.clone(), true);
+        ctx.handle_select_hover_drag_interactions(
+            response,
+            item.clone(),
+            is_blueprint_tree_editing_enabled(),
+        );
         ctx.handle_select_focus_sync(response, item.clone());
 
         self.handle_range_selection(ctx, blueprint_tree_data, item.clone(), response);
@@ -869,6 +917,10 @@ impl BlueprintTree {
         contents: Contents,
         response: &egui::Response,
     ) {
+        if !is_blueprint_tree_editing_enabled() {
+            return;
+        }
+
         //
         // check if a drag with acceptable content is in progress
         //
@@ -920,6 +972,10 @@ impl BlueprintTree {
         response: &egui::Response,
         body_response: Option<&egui::Response>,
     ) {
+        if !is_blueprint_tree_editing_enabled() {
+            return;
+        }
+
         //
         // check if a drag with acceptable content is in progress
         //
@@ -998,6 +1054,10 @@ impl BlueprintTree {
         ui: &egui::Ui,
         empty_space: egui::Rect,
     ) {
+        if !is_blueprint_tree_editing_enabled() {
+            return;
+        }
+
         //
         // check if a drag with acceptable content is in progress
         //
@@ -1041,6 +1101,10 @@ impl BlueprintTree {
         dragged_contents: &[Contents],
         drop_target: &DropTarget<Contents>,
     ) {
+        if !is_blueprint_tree_editing_enabled() {
+            return;
+        }
+
         // We cannot allow the target location to be "inside" any of the dragged items, because that
         // would amount to moving myself inside of me.
         let parent_contains_dragged_content = |content: &Contents| {

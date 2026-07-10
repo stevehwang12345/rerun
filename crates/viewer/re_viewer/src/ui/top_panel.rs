@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "rms_white_label", allow(dead_code))]
+
 use egui::{
     Align, Atom, Button, Color32, Id, Image, Layout, Popup, RichText, Sense, include_image,
 };
@@ -11,6 +13,8 @@ use re_viewer_context::{ActiveStoreContext, StoreHub, SystemCommand, SystemComma
 use crate::App;
 use crate::app_blueprint::AppBlueprint;
 use crate::latency_tracker::{LatencyResult, ServerLatencyTrackers};
+
+// allow: SIZE_OK — upstream top panel owns many egui controls; RMS policy stays local to reduce merge conflicts.
 
 pub fn top_panel(
     frame: &eframe::Frame,
@@ -98,13 +102,23 @@ fn top_bar_ui(
     ui: &mut egui::Ui,
     gpu_resource_stats: &WgpuResourcePoolStatistics,
 ) {
+    #[cfg(feature = "rms_white_label")]
+    {
+        let _ = (app_blueprint, store_hub, gpu_resource_stats);
+        rms_top_bar_ui(frame, app, store_context, ui);
+        return;
+    }
+
+    #[cfg(not(feature = "rms_white_label"))]
     app.rerun_menu_button_ui(frame.wgpu_render_state(), store_context, ui);
 
+    #[cfg(not(feature = "rms_white_label"))]
     if !app.startup_options().web_history_enabled() {
         ui.add_space(12.0);
         app.navigation_buttons(ui);
     }
 
+    #[cfg(not(feature = "rms_white_label"))]
     if !app.is_screenshotting() && !app.app_env().is_test() {
         show_warnings(frame, ui, app.app_env()); // Fixed width: put first
 
@@ -157,6 +171,7 @@ fn top_bar_ui(
         }
     }
 
+    #[cfg(not(feature = "rms_white_label"))]
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if app.custom_window_decorations() && !cfg!(target_arch = "wasm32") {
             #[cfg(not(target_arch = "wasm32"))]
@@ -179,6 +194,66 @@ fn top_bar_ui(
                 store_hub,
             );
         }
+    });
+}
+
+#[cfg(feature = "rms_white_label")]
+fn rms_top_bar_ui(
+    frame: &eframe::Frame,
+    app: &mut App,
+    store_context: Option<&ActiveStoreContext<'_>>,
+    ui: &mut egui::Ui,
+) {
+    app.rerun_menu_button_ui(frame.wgpu_render_state(), store_context, ui);
+
+    if !app.is_screenshotting() && !app.app_env().is_test() {
+        show_warnings(frame, ui, app.app_env());
+    }
+
+    ui.add_space(12.0);
+    rms_status_label_ui(
+        ui,
+        "Source",
+        if store_context.is_some() {
+            "active"
+        } else {
+            "waiting"
+        },
+    );
+
+    if let Some(store_context) = store_context {
+        rms_status_label_ui(
+            ui,
+            "Recording",
+            store_context.recording.recording_id().as_str(),
+        );
+    }
+
+    let playback = app
+        .active_recording_id()
+        .and_then(|id| app.state.time_controls.get(id))
+        .map(|time_ctrl| match time_ctrl.play_state() {
+            re_sdk_types::blueprint::components::PlayState::Paused => "paused",
+            re_sdk_types::blueprint::components::PlayState::Playing => "playing",
+            re_sdk_types::blueprint::components::PlayState::Following => "following",
+        })
+        .unwrap_or("idle");
+    rms_status_label_ui(ui, "Playback", playback);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.custom_window_decorations() {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.native_window_buttons_ui();
+        });
+    }
+}
+
+#[cfg(feature = "rms_white_label")]
+fn rms_status_label_ui(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.weak(label);
+        ui.label(value);
     });
 }
 
