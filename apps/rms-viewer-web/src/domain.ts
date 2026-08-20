@@ -1,25 +1,32 @@
-export type ProjectStatus = "active" | "standby";
+export type ProjectStatus = "active" | "standby" | "archived";
+export type IntegrationKind = "ros2" | "mcap" | "rtsp" | "mavlink" | "autoware" | "rerun";
+export type IntegrationStatus = "connected" | "degraded" | "disconnected" | "testing";
 export type DeviceStatus = "online" | "degraded" | "offline";
 export type DeviceHealth = "normal" | "attention" | "restricted" | "critical";
 export type DeviceKind = "robot" | "drone" | "vehicle";
+export type DataSourceStatus = "ready" | "recording" | "degraded" | "offline";
 export type DataSourceKind = "live" | "recording";
 export type SessionMode = "live" | "paused" | "replay";
 export type TopicRenderer = "spatial" | "camera" | "timeseries" | "state" | "log";
 export type TopicQuality = "fresh" | "delayed" | "unavailable";
 export type CommandRisk = "low" | "medium" | "high" | "emergency";
 
-export interface Project {
+export interface Integration {
   id: string;
+  organizationId: string;
   name: string;
-  description: string;
-  status: ProjectStatus;
-  deviceCount: number;
-  onlineDeviceCount: number;
+  kind: IntegrationKind;
+  status: IntegrationStatus;
+  endpointLabel: string;
+  lastHealthAt: string;
+  createdAt: string;
+  resourceVersion: number;
 }
 
 export interface Device {
   id: string;
-  projectId: string;
+  organizationId: string;
+  integrationId: string;
   name: string;
   kind: DeviceKind;
   status: DeviceStatus;
@@ -32,21 +39,55 @@ export interface Device {
   stateVersion: number;
 }
 
+/** A physical input registered by RMS Connect. Project ownership lives in DataAssignment. */
 export interface DataSource {
+  id: string;
+  integrationId: string;
+  deviceId: string;
+  name: string;
+  protocol: string;
+  status: DataSourceStatus;
+  liveUrl: string;
+  topicIds: string[];
+  mappingVersion: number;
+  lastDataAt: string;
+}
+
+export interface Project {
+  id: string;
+  organizationId: string;
+  name: string;
+  description: string;
+  status: ProjectStatus;
+  deviceCount: number;
+  onlineDeviceCount: number;
+  createdAt: string;
+  resourceVersion: number;
+}
+
+export interface DeviceAssignment {
   id: string;
   projectId: string;
   deviceId: string;
-  name: string;
-  kind: DataSourceKind;
-  status: "ready" | "recording" | "processing";
-  rrdUrl: string;
-  capturedAt: string;
-  durationLabel?: string;
-  topicIds: string[];
+  accessMode: "control" | "observe";
+  validFrom: string;
+  validTo?: string;
+  resourceVersion: number;
+}
+
+export interface DataAssignment {
+  id: string;
+  projectId: string;
+  dataSourceId: string;
+  visibility: "operator" | "analyst" | "restricted";
+  validFrom: string;
+  validTo?: string;
+  resourceVersion: number;
 }
 
 export interface Topic {
   id: string;
+  dataSourceId: string;
   deviceId: string;
   path: string;
   label: string;
@@ -59,8 +100,93 @@ export interface Topic {
   updatedAt: string;
 }
 
+export interface LiveSession {
+  id: string;
+  projectId: string;
+  deviceId: string;
+  dataSourceId: string;
+  openedBy: string;
+  status: "open" | "closed";
+  playState: "following" | "paused";
+  sourceHealth: TopicQuality;
+  streamUrl: string;
+  startedAt: string;
+  closedAt?: string;
+  resourceVersion: number;
+}
+
+export interface RecordingProjectSnapshot {
+  projectId: string;
+  projectName: string;
+  capturedAt: string;
+  deviceAssignmentId: string;
+  dataAssignmentId: string;
+}
+
+export interface Recording {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  deviceId: string;
+  dataSourceId: string;
+  name: string;
+  status: "finalizing" | "ready" | "failed";
+  rrdUrl: string;
+  capturedAt: string;
+  durationLabel: string;
+  topicIds: string[];
+  mappingVersion: number;
+  projectSnapshot: RecordingProjectSnapshot;
+  resourceVersion: number;
+}
+
+export interface ReplaySession {
+  id: string;
+  projectId: string;
+  recordingId: string;
+  deviceId: string;
+  openedBy: string;
+  status: "open" | "closed";
+  streamUrl: string;
+  cursorSeconds: number;
+  openedAt: string;
+  closedAt?: string;
+  resourceVersion: number;
+}
+
+/** A single Project Service revision, used instead of stitching mutable list responses together. */
+export interface WorkspaceSnapshot {
+  snapshotVersion: number;
+  capturedAt: string;
+  project: Project;
+  deviceAssignments: DeviceAssignment[];
+  dataAssignments: DataAssignment[];
+  devices: Device[];
+  dataSources: DataSource[];
+  recordings: Recording[];
+  topicsByDataSource: Record<string, Topic[]>;
+}
+
+export type ViewerSourceRef =
+  | { kind: "live"; liveSessionId: string; dataSourceId: string }
+  | { kind: "recording"; replaySessionId: string; recordingId: string };
+
+/** Compatibility projection for the current one-canvas host while routes migrate to sessions. */
+export interface ViewerDataSource {
+  id: string;
+  deviceId: string;
+  name: string;
+  kind: DataSourceKind;
+  status: "ready" | "recording" | "processing";
+  rrdUrl: string;
+  capturedAt: string;
+  durationLabel?: string;
+  topicIds: string[];
+}
+
 export interface ControlLease {
   id: string;
+  liveSessionId: string;
   deviceId: string;
   holderId: string;
   holderName: string;
@@ -75,20 +201,23 @@ export interface ControlCommandDefinition {
   description: string;
 }
 
-export interface ControlCommandRequest {
+/** The Control Service contract always carries its authorized Live Session. */
+export interface LiveControlCommandRequest {
+  liveSessionId: string;
   deviceId: string;
   commandType: string;
   expectedDeviceVersion: number;
   idempotencyKey: string;
   leaseId: string;
   leaseEpoch: number;
-  sessionMode: SessionMode;
+  sessionMode: "live";
   issuedAt: string;
   expiresAt: string;
 }
 
 export interface CommandReceipt {
   commandId: string;
+  liveSessionId: string;
   commandType: string;
   status: "accepted" | "executing" | "succeeded" | "rejected";
   message: string;
@@ -100,6 +229,7 @@ interface RmsEventBase {
   occurredAt: string;
   projectId: string;
   deviceId: string;
+  liveSessionId: string;
   resourceVersion: number;
 }
 
@@ -121,9 +251,17 @@ export type RmsEvent =
       data: CommandReceipt;
     });
 
+export type WorkspaceEvent = {
+  eventId: string;
+  type: "project.workspace.changed";
+  occurredAt: string;
+  projectId: string;
+  snapshotVersion: number;
+};
+
 export interface ControlEligibilityInput {
   device: Device;
-  source: DataSource;
+  source: Pick<ViewerDataSource, "kind">;
   mode: SessionMode;
   lease: ControlLease | null;
   operatorId: string;
@@ -186,6 +324,20 @@ export function statusLabel(status: DeviceStatus): string {
   }[status];
 }
 
-export function sourceMode(source: DataSource): SessionMode {
+export function compactTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "시간 미상";
+  }
+  return new Intl.DateTimeFormat("ko-KR", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+export function sourceMode(source: Pick<ViewerDataSource, "kind">): SessionMode {
   return source.kind === "live" ? "live" : "replay";
 }

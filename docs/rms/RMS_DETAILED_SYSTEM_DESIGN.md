@@ -1303,10 +1303,10 @@ Autoware supported release
 
 ### P0
 
-- [ ] 공식 Rerun build 환경 복구
+- [x] 로컬 공식 Rerun Native/Wasm build 환경 복구
 - [ ] `rms_domain`과 `rms_control_proto` 설계 확정
 - [ ] Control/Observation process 및 credential 분리
-- [ ] Live/Replay control gate invariant 구현
+- [x] 로컬 Vertical Slice의 Live/Replay control gate invariant 구현
 - [ ] Lease/fencing/idempotency state machine
 - [ ] Edge Safety Agent skeleton
 - [ ] command/audit Rerun component 정의

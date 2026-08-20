@@ -55,6 +55,16 @@ fn pending_timeline_shortcut_key() -> egui::Id {
     egui::Id::new("rerun_pending_timeline_shortcut")
 }
 
+fn viewer_url_matches_loaded_url(requested_url: &str, loaded_url: &ViewerOpenUrl) -> bool {
+    ViewerOpenUrl::parse_with_options(
+        requested_url,
+        &re_data_source::FromUriOptions {
+            accept_extensionless_http: true,
+        },
+    )
+    .is_ok_and(|requested_url| requested_url == *loaded_url)
+}
+
 #[cfg(target_arch = "wasm32")]
 struct PendingFilePromise {
     recommended_store_id: Option<StoreId>,
@@ -595,6 +605,26 @@ impl App {
         self.active_recording_id()
             .and_then(|store_id| self.state.time_control(store_id))
             .map(re_viewer_context::TimeControl::play_state)
+    }
+
+    /// Whether the active recording was loaded from `url`.
+    ///
+    /// Product applications use this read-only check to correlate an asynchronously opened source
+    /// before enabling source-sensitive actions.
+    pub fn active_recording_loaded_from_url(&self, url: &str) -> bool {
+        let Some(store_id) = self.active_recording_id() else {
+            return false;
+        };
+        let Some(store_hub) = &self.store_hub else {
+            return false;
+        };
+        let Some(recording) = store_hub.entity_db(store_id) else {
+            return false;
+        };
+        recording.data_source.as_ref().is_some_and(|source| {
+            ViewerOpenUrl::from_data_source(source)
+                .is_ok_and(|loaded_url| viewer_url_matches_loaded_url(url, &loaded_url))
+        })
     }
 
     /// Select `item` and navigate the viewer to it (if it maps to a route).
@@ -1816,5 +1846,35 @@ fn blueprint_loader(component_reflection: Arc<ComponentReflectionMap>) -> Bluepr
             crate::blueprint::is_valid_blueprint(blueprint, &component_reflection)
         })),
         deleter: Some(Box::new(crate::saving::delete_blueprint)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use re_viewer_context::open_url::ViewerOpenUrl;
+
+    use super::viewer_url_matches_loaded_url;
+
+    fn parse_url(url: &str) -> ViewerOpenUrl {
+        ViewerOpenUrl::parse_with_options(
+            url,
+            &re_data_source::FromUriOptions {
+                accept_extensionless_http: true,
+            },
+        )
+        .expect("test URL should parse")
+    }
+
+    #[test]
+    fn loaded_source_url_comparison_uses_normalized_url_identity() {
+        let loaded_url = parse_url("https://example.com/stream.rrd");
+        assert!(viewer_url_matches_loaded_url(
+            "HTTPS://EXAMPLE.COM:443/stream.rrd",
+            &loaded_url,
+        ));
+        assert!(!viewer_url_matches_loaded_url(
+            "https://example.com/other.rrd",
+            &loaded_url,
+        ));
     }
 }

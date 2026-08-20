@@ -1,15 +1,58 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CommandReceipt, ControlLease } from "../domain";
+import type {
+  CommandReceipt,
+  ControlLease,
+  LiveSession,
+  ReplaySession,
+  WorkspaceSnapshot,
+} from "../domain";
 import { HttpRmsApi } from "./rmsApi";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("HttpRmsApi backend contract", () => {
-  it("sends control lease requests with state and idempotency guards", async () => {
+describe("HttpRmsApi service contracts", () => {
+  it("loads a project workspace as one versioned snapshot", async () => {
+    const snapshot = { snapshotVersion: 17 } as WorkspaceSnapshot;
+    const fetchMock = vi.fn(async () => jsonResponse(snapshot));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = new HttpRmsApi("/api/");
+    expect(await api.projects.getWorkspace("project 1")).toEqual(snapshot);
+    const [url] = fetchMock.mock.calls[0] as unknown as [string];
+    expect(url).toBe("/api/v1/projects/project%201/workspace");
+  });
+
+  it("creates Live sessions through the Live boundary", async () => {
+    const session = {
+      id: "live-1",
+      projectId: "project-1",
+      deviceId: "robot-07",
+      dataSourceId: "source-1",
+    } as LiveSession;
+    const fetchMock = vi.fn(async () => jsonResponse(session, 201));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = new HttpRmsApi("/api");
+    const input = {
+      projectId: "project-1",
+      deviceId: "robot-07",
+      dataSourceId: "source-1",
+      openedBy: "operator-01",
+    };
+    await api.live.createSession(input);
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/api/v1/live-sessions");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual(input);
+  });
+
+  it("scopes lease requests to a Live session with state and idempotency guards", async () => {
     const lease: ControlLease = {
       id: "lease-1",
+      liveSessionId: "live-1",
       deviceId: "robot-07",
       holderId: "operator-01",
       holderName: "나",
@@ -20,11 +63,11 @@ describe("HttpRmsApi backend contract", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const api = new HttpRmsApi("/api/");
-    await api.requestControlLease("robot-07", 142);
+    await api.control.requestLease("live-1", 142);
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const headers = init.headers as Record<string, string>;
-    expect(url).toBe("/api/v1/devices/robot-07/control-leases");
+    expect(url).toBe("/api/v1/live-sessions/live-1/control-leases");
     expect(init.method).toBe("POST");
     expect(headers["Idempotency-Key"]).toBeTruthy();
     expect(headers["X-RMS-Request-ID"]).toBeTruthy();
@@ -34,9 +77,10 @@ describe("HttpRmsApi backend contract", () => {
     });
   });
 
-  it("preserves the command safety envelope and request headers", async () => {
+  it("preserves the Live session command safety envelope", async () => {
     const receipt: CommandReceipt = {
       commandId: "cmd-1",
+      liveSessionId: "live-1",
       commandType: "safe_stop",
       status: "accepted",
       message: "요청을 받았습니다.",
@@ -47,6 +91,7 @@ describe("HttpRmsApi backend contract", () => {
 
     const api = new HttpRmsApi("/api");
     const request = {
+      liveSessionId: "live-1",
       deviceId: "robot-07",
       commandType: "safe_stop",
       expectedDeviceVersion: 142,
@@ -57,14 +102,36 @@ describe("HttpRmsApi backend contract", () => {
       issuedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 3_000).toISOString(),
     };
-    await api.sendControlCommand(request);
+    await api.control.sendCommand(request);
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const headers = init.headers as Record<string, string>;
-    expect(url).toBe("/api/v1/devices/robot-07/commands");
+    expect(url).toBe("/api/v1/live-sessions/live-1/commands");
     expect(headers["Idempotency-Key"]).toBe(request.idempotencyKey);
     expect(headers["X-RMS-Request-ID"]).toBeTruthy();
     expect(JSON.parse(String(init.body))).toEqual(request);
+  });
+
+  it("creates Replay sessions on a separate command-free API", async () => {
+    const session = {
+      id: "replay-1",
+      projectId: "project-1",
+      recordingId: "recording-1",
+    } as ReplaySession;
+    const fetchMock = vi.fn(async () => jsonResponse(session, 201));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = new HttpRmsApi("/api");
+    await api.replay.createSession({
+      projectId: "project-1",
+      recordingId: "recording-1",
+      openedBy: "operator-01",
+    });
+
+    const [url] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/api/v1/replay-sessions");
+    expect("sendCommand" in api.replay).toBe(false);
+    expect("requestLease" in api.replay).toBe(false);
   });
 });
 

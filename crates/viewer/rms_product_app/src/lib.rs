@@ -10,7 +10,8 @@ mod product_app;
 mod web;
 
 pub use product_app::{
-    RmsControlResponse, RmsProductApp, RmsProductEvent, RmsProductEventSink, RmsSourceKind,
+    LiveViewerContext, ReplayViewerContext, RmsControlEvent, RmsControlEventSink,
+    RmsControlResponse, RmsHostEvent, RmsHostEventSink, RmsProductApp, RmsSourceKind,
     RmsTopicContext, RmsViewerContext,
 };
 

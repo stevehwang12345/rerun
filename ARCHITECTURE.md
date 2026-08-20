@@ -188,6 +188,7 @@ Update instructions:
 | re_protos            | Rerun remote store gRPC API types                               |
 | re_query             | Querying data in the re_chunk_store                             |
 | re_sdk_types         | The built-in Rerun data types, component types, and archetypes. |
+| rms_server           | RMS Connect, Projects, Live, Replay, and Live-only Control API. |
 | re_server            | In-memory data server                                           |
 | re_tf                | Dealing with spatial transforms & transform frames              |
 

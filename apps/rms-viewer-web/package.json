@@ -6,7 +6,9 @@
   "scripts": {
     "runtime:debug": "node ./scripts/build-runtime.mjs --debug",
     "runtime:release": "node ./scripts/build-runtime.mjs --release",
-    "dev": "npm run runtime:debug && vite --host 127.0.0.1 --port 4173",
+    "dev": "npm run dev:system",
+    "dev:system": "npm run runtime:debug && node ./scripts/dev-system.mjs",
+    "dev:mock": "npm run runtime:debug && vite --mode mock --host 127.0.0.1 --port 4173",
     "dev:host": "vite --host 127.0.0.1 --port 4173",
     "build": "npm run runtime:release && npm run build:host",
     "build:host": "tsc -b && vite build",

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const arguments_ = new Set(process.argv.slice(2));
@@ -23,6 +24,35 @@ if (debug && release) {
     rmSync(new URL(artifact, runtimeDirectory), { force: true });
   }
   const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
+  const buildEnvironment = { ...process.env };
+  if (process.platform === "win32") {
+    const toolchains = spawnSync("rustup.exe", ["toolchain", "list"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    const gnuToolchain = "1.95.0-x86_64-pc-windows-gnu";
+    if (toolchains.stdout?.includes(gnuToolchain)) {
+      buildEnvironment.RUSTUP_TOOLCHAIN = gnuToolchain;
+    }
+
+    const llvmDirectory = join(
+      process.env.USERPROFILE ?? "",
+      "scoop",
+      "apps",
+      "llvm",
+      "current",
+      "bin",
+    );
+    const clang = join(llvmDirectory, "clang.exe");
+    const llvmAr = join(llvmDirectory, "llvm-ar.exe");
+    if (existsSync(clang) && existsSync(llvmAr)) {
+      buildEnvironment.CC_wasm32_unknown_unknown = clang;
+      buildEnvironment.AR_wasm32_unknown_unknown = llvmAr;
+      const systemPath = process.env.PATH ?? process.env.Path ?? "";
+      delete buildEnvironment.Path;
+      buildEnvironment.PATH = `${llvmDirectory};${systemPath}`;
+    }
+  }
   const profile = debug ? "--debug" : "--release";
   const command = [
     "run",
@@ -48,10 +78,11 @@ if (debug && release) {
     cwd: repositoryRoot,
     stdio: "inherit",
     shell: false,
+    env: buildEnvironment,
   });
 
   if (result.error) {
-    console.error("RMS runtime build failed.");
+    console.error("RMS runtime build failed.", result.error.message);
     process.exitCode = 1;
   } else {
     process.exitCode = result.status ?? 1;

@@ -4,13 +4,14 @@ import {
   deriveControlEligibility,
   type ControlEligibilityInput,
   type ControlLease,
-  type DataSource,
   type Device,
+  type ViewerDataSource,
 } from "./domain";
 
 const device: Device = {
   id: "robot-07",
-  projectId: "project-1",
+  organizationId: "organization-1",
+  integrationId: "integration-1",
   name: "Robot-07",
   kind: "robot",
   status: "online",
@@ -23,9 +24,8 @@ const device: Device = {
   stateVersion: 3,
 };
 
-const source: DataSource = {
+const source: ViewerDataSource = {
   id: "live",
-  projectId: "project-1",
   deviceId: device.id,
   name: "실시간",
   kind: "live",
@@ -37,6 +37,7 @@ const source: DataSource = {
 
 const lease: ControlLease = {
   id: "lease-1",
+  liveSessionId: "live-session-1",
   deviceId: device.id,
   holderId: OPERATOR_ID,
   holderName: "나",
@@ -56,6 +57,12 @@ function input(overrides: Partial<ControlEligibilityInput> = {}): ControlEligibi
   };
 }
 
+describe("RMS domain boundaries", () => {
+  it("keeps integration resources independent from project ownership", () => {
+    expect(device).not.toHaveProperty("projectId");
+  });
+});
+
 describe("deriveControlEligibility", () => {
   it("allows control only for the current live lease holder", () => {
     expect(deriveControlEligibility(input())).toEqual({
@@ -67,7 +74,7 @@ describe("deriveControlEligibility", () => {
   it("fails closed in replay", () => {
     expect(
       deriveControlEligibility(
-        input({ source: { ...source, kind: "recording" }, mode: "replay" }),
+        input({ source: { kind: "recording" }, mode: "replay" }),
       ),
     ).toEqual({
       allowed: false,
