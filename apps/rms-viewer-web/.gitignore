@@ -4,3 +4,4 @@ dist/
 .vite/
 coverage/
 *.tsbuildinfo
+public/runtime/

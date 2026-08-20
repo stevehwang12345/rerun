@@ -11774,6 +11774,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rms_product_app"
+version = "0.36.1"
+dependencies = [
+ "eframe",
+ "egui",
+ "js-sys",
+ "re_async",
+ "re_crash_handler",
+ "re_log",
+ "re_renderer",
+ "re_sdk_types",
+ "re_viewer",
+ "re_viewer_context",
+ "serde",
+ "serde-wasm-bindgen",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "roaring"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

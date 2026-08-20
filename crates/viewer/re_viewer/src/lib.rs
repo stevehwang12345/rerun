@@ -66,6 +66,7 @@ mod loading;
 pub mod blueprint;
 
 pub use app::App;
+pub use app_blueprint::PanelStateOverrides;
 pub(crate) use app_state::AppState;
 pub use event::{SelectionChangeItem, ViewerEvent, ViewerEventKind};
 pub use external_memory::ExternalMemoryUser;
@@ -215,7 +216,11 @@ impl AppEnvironment {
 
 // ---------------------------------------------------------------------------
 
-pub(crate) fn wgpu_options(force_wgpu_backend: Option<&str>) -> egui_wgpu::WgpuConfiguration {
+/// Creates the `wgpu` configuration used by the Rerun Viewer.
+///
+/// Custom applications which wrap [`App`] should use this to ensure their
+/// [`eframe`] runner selects and configures the renderer in the same way as the Viewer.
+pub fn wgpu_options(force_wgpu_backend: Option<&str>) -> egui_wgpu::WgpuConfiguration {
     re_tracing::profile_function!();
 
     let instance_descriptor = re_renderer::device_caps::instance_descriptor(force_wgpu_backend);

@@ -6,7 +6,9 @@
 
 현재 저장소에는 Rerun 데이터 서버와 Web Viewer는 있지만 프로젝트, 디바이스, Topic mapping 및 물리 장비 제어를 담당하는 RMS 백엔드는 없다.
 Rerun `re_grpc_server`와 Redap은 RRD 및 Chunk 데이터 경로로 유지하고 제품 메타데이터와 제어는 RMS API가 담당해야 한다.
-Web Viewer iframe은 프로그램 제어 범위가 작으므로 `@rerun-io/web-viewer`를 전용 React Adapter로 감싼다.
+iframe과 `@rerun-io/web-viewer` wrapper는 사용하지 않는다.
+`rms_product_app`이 `re_viewer::App`을 직접 조립하고 Native와 Web에서 동일한 egui 제품 UI를 소유한다.
+React host는 canvas, Wasm 부팅, 인증된 RMS API transport만 담당한다.
 
 ## 사용자 시나리오
 
@@ -28,9 +30,10 @@ Web Viewer iframe은 프로그램 제어 범위가 작으므로 `@rerun-io/web-v
 ## 데이터 경로
 
 ```text
-RMS Web Shell
-├── /api/v1             Project, Device, Source, Topic, Lease, Command
-└── /rerun              RRD, Redap 또는 gRPC Web Viewer data path
+RMS Product Runtime
+├── React transport     /api/v1 Project, Device, Source, Topic, Lease, Command
+├── Rust/egui product   Project, Device, Topic, Viewer, Time, Control eligibility
+└── Rerun runtime       /rerun RRD, Redap 또는 gRPC data path
 ```
 
 RMS API는 Chunk payload를 JSON으로 변환하지 않는다.
@@ -57,8 +60,8 @@ SSE의 Topic 이벤트는 `data_source_id` 범위로 제한하여 Replay 화면�
 
 ## 구현 단계
 
-- Phase 1은 현재 구현된 Web Shell, Mock API, Rerun Adapter와 제어 차단 정책이다.
-- Phase 2는 실제 RMS REST/SSE 서버와 프로젝트, 디바이스, Preset persistence이다.
+- Phase 1은 현재 구현된 `rms_product_app`, 최소 Web host, REST catalog adapter, Mock API transport와 제어 차단 정책이다.
+- Phase 2는 실제 RMS 서버의 SSE 상태 동기화, 전체 프로젝트 선택과 Preset persistence이다.
 - Phase 3은 Rerun Blueprint 생성기와 Topic-to-Entity mapping이다.
 - Phase 4는 Simulator 및 Edge Safety Agent를 통한 제어다.
 - Phase 5에서 HIL 안전 검증 후 제한된 실장비를 연결한다.
@@ -66,5 +69,6 @@ SSE의 Topic 이벤트는 `data_source_id` 범위로 제한하여 Replay 화면�
 ## 현재 제한
 
 Mock LIVE는 공개 RRD를 사용하므로 실제로 증가하는 Stream이 아니다.
-Viewer 공개 API에는 안정적인 Return-to-live, 재생 속도, 연결 건강 및 Blueprint 전환 API가 부족하다.
+Return-to-live와 실제 Rerun play state 동기화는 `TimeControlCommand`로 연결했지만 재생 속도, 연결 건강과 Blueprint preset은 후속 product seam이 필요하다.
+현재 Rust 장비 선택기는 세 개의 검증용 ID로 제한되며 전체 프로젝트와 장비 목록의 동적 렌더링은 Phase 2 범위다.
 실장비 명령은 구현하지 않았으며 Mock 명령도 Replay, Lease, 장비 상태와 state version 검증을 통과해야 한다.

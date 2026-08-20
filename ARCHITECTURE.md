@@ -163,6 +163,7 @@ Update instructions:
 | re_viewer              | The Rerun Viewer                                                                                           |
 | re_viewer_mcp          | MCP server that allows agents to interact with the viewer.                                                 |
 | re_viewport            | The central viewport panel of the Rerun viewer.                                                            |
+| rms_product_app        | RMS product-owned native and Wasm application that embeds the Rerun Viewer.                                |
 
 ##### UI support crates
 

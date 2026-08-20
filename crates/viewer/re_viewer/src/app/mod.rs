@@ -587,6 +587,16 @@ impl App {
         self.state.active_recording_id()
     }
 
+    /// The authoritative play state for the active recording, if one is ready.
+    ///
+    /// Product applications embedding the viewer use this to keep safety-critical
+    /// controls synchronized with timeline shortcuts and internal viewer commands.
+    pub fn active_play_state(&self) -> Option<PlayState> {
+        self.active_recording_id()
+            .and_then(|store_id| self.state.time_control(store_id))
+            .map(re_viewer_context::TimeControl::play_state)
+    }
+
     /// Select `item` and navigate the viewer to it (if it maps to a route).
     fn select_and_navigate_to(&self, item: &Item) {
         self.command_sender

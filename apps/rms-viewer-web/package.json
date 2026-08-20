@@ -4,14 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 4173",
-    "build": "tsc -b && vite build",
+    "runtime:debug": "node ./scripts/build-runtime.mjs --debug",
+    "runtime:release": "node ./scripts/build-runtime.mjs --release",
+    "dev": "npm run runtime:debug && vite --host 127.0.0.1 --port 4173",
+    "dev:host": "vite --host 127.0.0.1 --port 4173",
+    "build": "npm run runtime:release && npm run build:host",
+    "build:host": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@rerun-io/web-viewer": "0.36.1",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

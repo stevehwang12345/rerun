@@ -53,6 +53,7 @@ impl Profile {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Browser,
+    Web,
     Module,
 
     /// Custom target meant for post-processing inside `rerun_js`.
@@ -63,6 +64,7 @@ impl argh::FromArgValue for Target {
     fn from_arg_value(value: &str) -> Result<Self, String> {
         match value {
             "browser" => Ok(Self::Browser),
+            "web" => Ok(Self::Web),
             "module" => Ok(Self::Module),
             "no-modules-base" => Ok(Self::NoModulesBase),
             _ => Err(format!("Unknown target: {value}")),
@@ -70,7 +72,8 @@ impl argh::FromArgValue for Target {
     }
 }
 
-/// Build `re_viewer` as Wasm, generate .js bindings for it, and place it all into the `build_dir` folder.
+/// Build a `cdylib` as Wasm, generate .js bindings for it, and place it all into the
+/// `build_dir` folder.
 ///
 /// If `debug_symbols` is set, debug symbols are kept even in release builds,
 /// allowing for better callstacks on panics, as well as in-browser profiling of the wasm.
@@ -80,15 +83,25 @@ pub fn build(
     debug_symbols: bool,
     target: Target,
     build_dir: &Utf8Path,
+    package: &str,
+    out_name: Option<&str>,
     no_default_features: bool,
-    features: &String,
+    features: &str,
     timings: bool,
 ) -> anyhow::Result<()> {
     std::env::set_current_dir(workspace_root())?;
 
     eprintln!("Building web viewer…\n");
 
-    let crate_name = "re_viewer";
+    anyhow::ensure!(!package.is_empty(), "Package name must not be empty");
+
+    let crate_name = cdylib_target_name(package)?;
+    let out_name = out_name.unwrap_or(&crate_name);
+    anyhow::ensure!(!out_name.is_empty(), "Output name must not be empty");
+    anyhow::ensure!(
+        !out_name.contains(['/', '\\']),
+        "Output name must be a file stem, got {out_name:?}"
+    );
 
     // Where we tell cargo to build to.
     // We want this to be different from the default target folder
@@ -99,16 +112,12 @@ pub fn build(
     let root_dir = workspace_root();
 
     // Where we will place the final .wasm and .js artifacts.
-    assert!(
-        build_dir.exists(),
-        "Failed to find dir {build_dir}. CWD: {:?}, CARGO_MANIFEST_DIR: {:?}",
-        std::env::current_dir(),
-        std::env!("CARGO_MANIFEST_DIR")
-    );
+    std::fs::create_dir_all(build_dir)
+        .with_context(|| format!("Failed to create output directory {build_dir}"))?;
 
     // The two files we are building:
-    let wasm_path = build_dir.join(format!("{crate_name}_bg.wasm"));
-    let js_path = build_dir.join(format!("{crate_name}.js"));
+    let wasm_path = build_dir.join(format!("{out_name}_bg.wasm"));
+    let js_path = build_dir.join(format!("{out_name}.js"));
 
     // Clean old versions:
     std::fs::remove_file(wasm_path.clone()).ok();
@@ -121,7 +130,7 @@ pub fn build(
         let mut cmd = std::process::Command::new("cargo");
         cmd.args([
             "build",
-            &format!("--package={crate_name}"),
+            &format!("--package={package}"),
             "--lib",
             "--target=wasm32-unknown-unknown",
             &format!("--target-dir={}", target_wasm_dir.as_str()),
@@ -179,9 +188,10 @@ pub fn build(
         let mut bindgen_cmd = wasm_bindgen_cli_support::Bindgen::new();
         bindgen_cmd
             .input_path(target_wasm_path.as_str())
-            .out_name(crate_name);
+            .out_name(out_name);
         match target {
             Target::Browser => bindgen_cmd.no_modules(true)?.typescript(false),
+            Target::Web => bindgen_cmd.web(true)?.typescript(true),
             Target::Module => bindgen_cmd.no_modules(false)?.typescript(true),
             Target::NoModulesBase => bindgen_cmd.no_modules(true)?.typescript(true),
         };
@@ -264,4 +274,33 @@ pub fn build(
     eprintln!("Finished {wasm_path}");
 
     Ok(())
+}
+
+fn cdylib_target_name(package_name: &str) -> anyhow::Result<String> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .features(cargo_metadata::CargoOpt::NoDefaultFeatures)
+        .no_deps()
+        .exec()?;
+
+    let package = metadata
+        .packages
+        .iter()
+        .find(|package| package.name.as_str() == package_name)
+        .with_context(|| format!("Failed to find Cargo package {package_name:?}"))?;
+
+    let mut cdylib_targets = package
+        .targets
+        .iter()
+        .filter(|target| target.is_kind(cargo_metadata::TargetKind::CDyLib));
+    let target = cdylib_targets
+        .next()
+        .with_context(|| format!("Cargo package {package_name:?} has no cdylib target"))?;
+
+    anyhow::ensure!(
+        cdylib_targets.next().is_none(),
+        "Cargo package {package_name:?} has more than one cdylib target"
+    );
+
+    Ok(target.name.clone())
 }

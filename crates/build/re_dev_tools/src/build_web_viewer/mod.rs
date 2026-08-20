@@ -34,11 +34,19 @@ pub struct Args {
     #[argh(option, short = 'o', long = "out")]
     build_dir: Option<Utf8PathBuf>,
 
-    /// comma-separated list of features to pass on to `re_viewer`
-    #[argh(option, short = 'F', long = "features", default = "default_features()")]
-    features: String,
+    /// cargo package containing the cdylib to build.
+    #[argh(option, long = "package", default = "default_package()")]
+    package: String,
 
-    /// whether to exclude default features from `re_viewer` wasm build
+    /// output stem passed to wasm-bindgen. Defaults to the cdylib target name.
+    #[argh(option, long = "out-name")]
+    out_name: Option<String>,
+
+    /// comma-separated list of features to pass to the selected package.
+    #[argh(option, short = 'F', long = "features")]
+    features: Option<String>,
+
+    /// whether to exclude default features from the selected package.
     #[argh(switch, long = "no-default-features")]
     no_default_features: bool,
 
@@ -47,8 +55,8 @@ pub struct Args {
     timings: bool,
 }
 
-fn default_features() -> String {
-    "analytics".to_owned()
+fn default_package() -> String {
+    "re_viewer".to_owned()
 }
 
 pub fn main(args: Args) -> anyhow::Result<()> {
@@ -63,14 +71,23 @@ pub fn main(args: Args) -> anyhow::Result<()> {
     };
 
     let build_dir = args.build_dir.unwrap_or_else(default_build_dir);
+    let features = args.features.unwrap_or_else(|| {
+        if args.package == default_package() {
+            "analytics".to_owned()
+        } else {
+            String::new()
+        }
+    });
 
     build(
         profile,
         args.debug_symbols,
         args.target,
         &build_dir,
+        &args.package,
+        args.out_name.as_deref(),
         args.no_default_features,
-        &args.features,
+        &features,
         args.timings,
     )
 }
