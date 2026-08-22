@@ -4,7 +4,7 @@ use std::ops::Range;
 use egui::emath::GuiRounding as _;
 use re_chunk_store::TimeInt;
 use re_data_ui::item_ui::{self, timeline_button};
-use re_dataframe_ui::re_table_utils::apply_table_style_fixes;
+use re_dataframe_ui::{CELL_SEPARATOR_STROKE_OFFSET, apply_table_style_fixes};
 use re_log::ResultExt as _;
 use re_log_types::{EntityPath, TimelineName};
 use re_sdk_types::archetypes::TextLog;
@@ -332,9 +332,9 @@ Filter message types and toggle column visibility in a selection panel.",
                 continue;
             }
             let (width, min_width) = match col.kind {
-                bp_datatypes::TextLogColumnKind::EntityPath => (120.0, 60.0),
-                bp_datatypes::TextLogColumnKind::LogLevel => (50.0, 44.0),
-                bp_datatypes::TextLogColumnKind::Body => (400.0, 100.0),
+                bp_encodings::TextLogColumnKind::EntityPath => (120.0, 60.0),
+                bp_encodings::TextLogColumnKind::LogLevel => (50.0, 44.0),
+                bp_encodings::TextLogColumnKind::Body => (400.0, 100.0),
             };
             column_kinds.push(ColumnKind::Kind(col.kind));
             table_columns.push(text_log_column(width, min_width));
@@ -403,7 +403,7 @@ Filter message types and toggle column visibility in a selection panel.",
 
 enum ColumnKind {
     Timeline(TimelineName),
-    Kind(bp_datatypes::TextLogColumnKind),
+    Kind(bp_encodings::TextLogColumnKind),
 }
 
 /// A resizable column that starts out `width` wide but may be squeezed down to `min_width`
@@ -489,7 +489,7 @@ impl egui_table::TableDelegate for TextLogTableDelegate<'_> {
         // Note: `apply_table_style_fixes` blanks `noninteractive.bg_stroke`, so use the token.
         ui.painter().hline(
             rect.x_range(),
-            rect.max.y - re_dataframe_ui::re_table_utils::CELL_SEPARATOR_STROKE_OFFSET,
+            rect.max.y - CELL_SEPARATOR_STROKE_OFFSET,
             egui::Stroke::new(1.0, ui.tokens().table_interaction_noninteractive_bg_stroke),
         );
     }
@@ -534,7 +534,7 @@ impl egui_table::TableDelegate for TextLogTableDelegate<'_> {
                             .unwrap_or(re_log_types::TimeInt::STATIC);
                         item_ui::time_button(self.ctx, ui, timeline, row_time);
                     }
-                    ColumnKind::Kind(bp_datatypes::TextLogColumnKind::EntityPath) => {
+                    ColumnKind::Kind(bp_encodings::TextLogColumnKind::EntityPath) => {
                         item_ui::entity_path_button(
                             &self.ctx.active_recording_store_view_context(),
                             ui,
@@ -542,14 +542,14 @@ impl egui_table::TableDelegate for TextLogTableDelegate<'_> {
                             &entry.entity_path,
                         );
                     }
-                    ColumnKind::Kind(bp_datatypes::TextLogColumnKind::LogLevel) => {
+                    ColumnKind::Kind(bp_encodings::TextLogColumnKind::LogLevel) => {
                         if let Some(lvl) = &entry.level {
                             ui.label(level_to_rich_text(ui, lvl));
                         } else {
                             ui.label("-");
                         }
                     }
-                    ColumnKind::Kind(bp_datatypes::TextLogColumnKind::Body) => {
+                    ColumnKind::Kind(bp_encodings::TextLogColumnKind::Body) => {
                         // Rows have a fixed height; show only the first line of multi-line bodies.
                         let body = entry.body.as_str();
                         let (first_line, truncated) = match body.split_once('\n') {
@@ -586,7 +586,7 @@ impl TextLogTableDelegate<'_> {
     fn paint_column_separator(&self, ui: &egui::Ui, col_nr: usize, rect: egui::Rect) {
         if col_nr + 1 < self.column_kinds.len() {
             ui.painter().vline(
-                rect.max.x - re_dataframe_ui::re_table_utils::CELL_SEPARATOR_STROKE_OFFSET,
+                rect.max.x - CELL_SEPARATOR_STROKE_OFFSET,
                 rect.y_range(),
                 egui::Stroke::new(1.0, ui.tokens().table_interaction_noninteractive_bg_stroke),
             );
