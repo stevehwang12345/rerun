@@ -76,6 +76,12 @@ impl LegacyViewerContext {
                 replay_session_id: self.source_id,
                 source_url: self.source_url,
                 captured_at_label: None,
+                initial_timeline: String::new(),
+                initial_fps: None,
+                initial_cursor: None,
+                initial_play_state: Default::default(),
+                initial_speed: 1.0,
+                initial_loop: Default::default(),
                 topics: self.topics,
             }),
         }

@@ -81,16 +81,17 @@ async fn workspace_events(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> ApiResult<Response> {
-    {
+    let mut workspace_version = {
         let catalog = state.catalog.read().await;
         if !catalog.projects.contains_key(&project_id) {
             return Err(ApiError::not_found("Project", &project_id));
         }
-    }
+        catalog.workspace_version.subscribe()
+    };
     let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(2);
     tokio::spawn(async move {
         loop {
-            let snapshot_version = state.catalog.read().await.snapshot_version;
+            let snapshot_version = *workspace_version.borrow_and_update();
             let event = json!({
                 "eventId": format!("workspace-event-{project_id}-{snapshot_version}"),
                 "type": "project.workspace.changed",
@@ -104,7 +105,9 @@ async fn workspace_events(
             if sender.send(Ok(event)).await.is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            if workspace_version.changed().await.is_err() {
+                break;
+            }
         }
     });
     Ok(Sse::new(ReceiverStream::new(receiver))
@@ -131,48 +134,51 @@ async fn create_project(
         ));
     }
 
-    let mut catalog = state.catalog.write().await;
-    let device_ids = request.device_ids.into_iter().collect::<BTreeSet<_>>();
-    let data_source_ids = request.data_source_ids.into_iter().collect::<BTreeSet<_>>();
-    validate_project_resources(
-        &catalog,
-        &request.organization_id,
-        &device_ids,
-        &data_source_ids,
-    )?;
+    let project = state
+        .durable_catalog_mutation(move |catalog| {
+            let device_ids = request.device_ids.into_iter().collect::<BTreeSet<_>>();
+            let data_source_ids = request.data_source_ids.into_iter().collect::<BTreeSet<_>>();
+            validate_project_resources(
+                catalog,
+                &request.organization_id,
+                &device_ids,
+                &data_source_ids,
+            )?;
 
-    let project_id = new_id("project");
-    let resource_version = catalog.snapshot_version.saturating_add(1);
-    let project = Project {
-        id: project_id.clone(),
-        organization_id: request.organization_id,
-        name: request.name,
-        description: request.description,
-        status: request.status,
-        device_count: 0,
-        online_device_count: 0,
-        created_at: now_iso(),
-        resource_version,
-    };
-    catalog.projects.insert(project_id.clone(), project);
-    for device_id in device_ids {
-        insert_device_assignment(&mut catalog, &project_id, device_id, AccessMode::Control)?;
-    }
-    for data_source_id in data_source_ids {
-        insert_data_assignment(
-            &mut catalog,
-            &project_id,
-            data_source_id,
-            DataVisibility::Operator,
-        )?;
-    }
-    catalog.refresh_project_counts(&project_id);
-    catalog.bump_version();
-    let project = catalog
-        .projects
-        .get(&project_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("Project", &project_id))?;
+            let project_id = new_id("project");
+            let resource_version = catalog.snapshot_version.saturating_add(1);
+            let project = Project {
+                id: project_id.clone(),
+                organization_id: request.organization_id,
+                name: request.name,
+                description: request.description,
+                status: request.status,
+                device_count: 0,
+                online_device_count: 0,
+                created_at: now_iso(),
+                resource_version,
+            };
+            catalog.projects.insert(project_id.clone(), project);
+            for device_id in device_ids {
+                insert_device_assignment(catalog, &project_id, device_id, AccessMode::Control)?;
+            }
+            for data_source_id in data_source_ids {
+                insert_data_assignment(
+                    catalog,
+                    &project_id,
+                    data_source_id,
+                    DataVisibility::Operator,
+                )?;
+            }
+            catalog.refresh_project_counts(&project_id);
+            catalog.bump_version();
+            catalog
+                .projects
+                .get(&project_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("Project", &project_id))
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -227,7 +233,17 @@ async fn get_workspace(
         .values()
         .filter(|recording| recording.project_id == project_id)
         .cloned()
-        .collect();
+        .collect::<Vec<_>>();
+    let topics_by_recording = recordings
+        .iter()
+        .filter_map(|recording| {
+            catalog
+                .topics_by_recording
+                .get(&recording.id)
+                .cloned()
+                .map(|topics| (recording.id.clone(), topics))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     Ok(Json(ProjectWorkspace {
         snapshot_version: catalog.snapshot_version,
@@ -238,6 +254,7 @@ async fn get_workspace(
         devices,
         data_sources,
         recordings,
+        topics_by_recording,
         topics_by_data_source,
     }))
 }
@@ -247,16 +264,20 @@ async fn create_device_assignment(
     Path(project_id): Path<String>,
     Json(request): Json<CreateDeviceAssignmentRequest>,
 ) -> ApiResult<(StatusCode, Json<DeviceAssignment>)> {
-    let mut catalog = state.catalog.write().await;
-    validate_assignment_project_and_device(&catalog, &project_id, &request.device_id)?;
-    let assignment = insert_device_assignment(
-        &mut catalog,
-        &project_id,
-        request.device_id,
-        request.access_mode,
-    )?;
-    catalog.refresh_project_counts(&project_id);
-    catalog.bump_version();
+    let assignment = state
+        .durable_catalog_mutation(move |catalog| {
+            validate_assignment_project_and_device(catalog, &project_id, &request.device_id)?;
+            let assignment = insert_device_assignment(
+                catalog,
+                &project_id,
+                request.device_id,
+                request.access_mode,
+            )?;
+            catalog.refresh_project_counts(&project_id);
+            catalog.bump_version();
+            Ok(assignment)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(assignment)))
 }
 
@@ -264,27 +285,40 @@ async fn delete_device_assignment(
     State(state): State<AppState>,
     Path((project_id, assignment_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let mut catalog = state.catalog.write().await;
-    let assignment = catalog
-        .device_assignments
-        .get(&assignment_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("DeviceAssignment", &assignment_id))?;
-    if assignment.project_id != project_id {
-        return Err(ApiError::not_found("DeviceAssignment", &assignment_id));
-    }
-    if catalog.live_sessions.values().any(|session| {
-        session.status == "open"
-            && session.project_id == project_id
-            && session.device_id == assignment.device_id
-    }) {
-        return Err(ApiError::conflict(
-            "Close the active LiveSession before deleting its DeviceAssignment.",
-        ));
-    }
-    catalog.device_assignments.remove(&assignment_id);
-    catalog.refresh_project_counts(&project_id);
-    catalog.bump_version();
+    state
+        .durable_catalog_mutation(move |catalog| {
+            let assignment = catalog
+                .device_assignments
+                .get(&assignment_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("DeviceAssignment", &assignment_id))?;
+            if assignment.project_id != project_id {
+                return Err(ApiError::not_found("DeviceAssignment", &assignment_id));
+            }
+            if catalog.live_sessions.values().any(|session| {
+                session.status == "open"
+                    && session.project_id == project_id
+                    && session.device_id == assignment.device_id
+            }) {
+                return Err(ApiError::conflict(
+                    "Close the active LiveSession before deleting its DeviceAssignment.",
+                ));
+            }
+            if catalog.recording_imports.values().any(|import| {
+                matches!(import.status.as_str(), "uploading" | "processing")
+                    && import.project_id == project_id
+                    && import.device_id == assignment.device_id
+            }) {
+                return Err(ApiError::conflict(
+                    "Cancel or finish the active RecordingImport before deleting its DeviceAssignment.",
+                ));
+            }
+            catalog.device_assignments.remove(&assignment_id);
+            catalog.refresh_project_counts(&project_id);
+            catalog.bump_version();
+            Ok(())
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -293,29 +327,35 @@ async fn create_data_assignment(
     Path(project_id): Path<String>,
     Json(request): Json<CreateDataAssignmentRequest>,
 ) -> ApiResult<(StatusCode, Json<DataAssignment>)> {
-    let mut catalog = state.catalog.write().await;
-    validate_assignment_project_and_source(&catalog, &project_id, &request.data_source_id)?;
-    let source = catalog
-        .data_sources
-        .get(&request.data_source_id)
-        .ok_or_else(|| ApiError::not_found("DataSource", &request.data_source_id))?;
-    let device_is_assigned = catalog.device_assignments.values().any(|assignment| {
-        assignment.project_id == project_id
-            && assignment.device_id == source.device_id
-            && assignment.valid_to.is_none()
-    });
-    if !device_is_assigned {
-        return Err(ApiError::conflict(
-            "Assign the DataSource Device to the Project first.",
-        ));
-    }
-    let assignment = insert_data_assignment(
-        &mut catalog,
-        &project_id,
-        request.data_source_id,
-        request.visibility,
-    )?;
-    catalog.bump_version();
+    let assignment = state
+        .durable_catalog_mutation(move |catalog| {
+            validate_assignment_project_and_source(catalog, &project_id, &request.data_source_id)?;
+            let source_device_id = catalog
+                .data_sources
+                .get(&request.data_source_id)
+                .ok_or_else(|| ApiError::not_found("DataSource", &request.data_source_id))?
+                .device_id
+                .clone();
+            let device_is_assigned = catalog.device_assignments.values().any(|assignment| {
+                assignment.project_id == project_id
+                    && assignment.device_id == source_device_id
+                    && assignment.valid_to.is_none()
+            });
+            if !device_is_assigned {
+                return Err(ApiError::conflict(
+                    "Assign the DataSource Device to the Project first.",
+                ));
+            }
+            let assignment = insert_data_assignment(
+                catalog,
+                &project_id,
+                request.data_source_id,
+                request.visibility,
+            )?;
+            catalog.bump_version();
+            Ok(assignment)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(assignment)))
 }
 
@@ -323,26 +363,39 @@ async fn delete_data_assignment(
     State(state): State<AppState>,
     Path((project_id, assignment_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let mut catalog = state.catalog.write().await;
-    let assignment = catalog
-        .data_assignments
-        .get(&assignment_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("DataAssignment", &assignment_id))?;
-    if assignment.project_id != project_id {
-        return Err(ApiError::not_found("DataAssignment", &assignment_id));
-    }
-    if catalog.live_sessions.values().any(|session| {
-        session.status == "open"
-            && session.project_id == project_id
-            && session.data_source_id == assignment.data_source_id
-    }) {
-        return Err(ApiError::conflict(
-            "Close the active LiveSession before deleting its DataAssignment.",
-        ));
-    }
-    catalog.data_assignments.remove(&assignment_id);
-    catalog.bump_version();
+    state
+        .durable_catalog_mutation(move |catalog| {
+            let assignment = catalog
+                .data_assignments
+                .get(&assignment_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("DataAssignment", &assignment_id))?;
+            if assignment.project_id != project_id {
+                return Err(ApiError::not_found("DataAssignment", &assignment_id));
+            }
+            if catalog.live_sessions.values().any(|session| {
+                session.status == "open"
+                    && session.project_id == project_id
+                    && session.data_source_id == assignment.data_source_id
+            }) {
+                return Err(ApiError::conflict(
+                    "Close the active LiveSession before deleting its DataAssignment.",
+                ));
+            }
+            if catalog.recording_imports.values().any(|import| {
+                matches!(import.status.as_str(), "uploading" | "processing")
+                    && import.project_id == project_id
+                    && import.data_source_id == assignment.data_source_id
+            }) {
+                return Err(ApiError::conflict(
+                    "Cancel or finish the active RecordingImport before deleting its DataAssignment.",
+                ));
+            }
+            catalog.data_assignments.remove(&assignment_id);
+            catalog.bump_version();
+            Ok(())
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

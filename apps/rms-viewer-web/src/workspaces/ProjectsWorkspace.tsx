@@ -253,7 +253,7 @@ function ProjectDetail({
             onClick={() => {
               setSaving(true);
               setSaveError(undefined);
-              void api.projects.assignDevice(workspace.project.id, { deviceId, accessMode: "control" })
+              void api.projects.assignDevice(workspace.project.id, { deviceId, accessMode: "observe" })
                 .then(() => { setDeviceId(""); return onRefresh(); })
                 .catch((cause: unknown) => setSaveError(cause instanceof Error ? cause.message : "추가하지 못했습니다"))
                 .finally(() => setSaving(false));

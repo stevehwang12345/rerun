@@ -1,15 +1,61 @@
 export type ProjectStatus = "active" | "standby" | "archived";
-export type IntegrationKind = "ros2" | "mcap" | "rtsp" | "mavlink" | "autoware" | "rerun";
+export type IntegrationKind = "ros2" | "mcap" | "rtsp" | "mavlink" | "autoware" | "rerun" | "rms_edge";
 export type IntegrationStatus = "connected" | "degraded" | "disconnected" | "testing";
 export type DeviceStatus = "online" | "degraded" | "offline";
-export type DeviceHealth = "normal" | "attention" | "restricted" | "critical";
-export type DeviceKind = "robot" | "drone" | "vehicle";
-export type DataSourceStatus = "ready" | "recording" | "degraded" | "offline";
+export type DeviceHealth = "unknown" | "normal" | "attention" | "restricted" | "critical";
+export type DeviceKind = "robot" | "drone" | "vehicle" | "camera" | "gateway";
+export type DataSourceStatus = "pending" | "ready" | "recording" | "degraded" | "offline";
 export type DataSourceKind = "live" | "recording";
 export type SessionMode = "live" | "paused" | "replay";
-export type TopicRenderer = "spatial" | "camera" | "timeseries" | "state" | "log";
+export type TopicRenderer =
+  | "spatial"
+  | "spatial2d"
+  | "spatial3d"
+  | "transform3d"
+  | "map"
+  | "camera"
+  | "timeseries"
+  | "state"
+  | "log"
+  | "raw";
 export type TopicQuality = "fresh" | "delayed" | "unavailable";
 export type CommandRisk = "low" | "medium" | "high" | "emergency";
+export type TimelineKind = "sequence" | "timestamp" | "duration";
+export type ReplayPlayState = "paused" | "playing";
+export type ReplayLoopMode = "off" | "all" | "selection";
+export type RecordingImportFormat = "rrd" | "mcap" | "ros2-bag-zip" | "csv" | "video";
+export type RecordingImportStatus =
+  | "uploading"
+  | "processing"
+  | "ready"
+  | "failed"
+  | "cancelled";
+export type DiscoverySessionStatus =
+  | "searching"
+  | "ready"
+  | "cancelled"
+  | "failed"
+  | "expired";
+export type DiscoveryCandidateStatus =
+  | "found"
+  | "verifying"
+  | "verified"
+  | "needs_attention"
+  | "unavailable"
+  | "already_linked";
+export type DiscoveryCandidateCategory =
+  | "robot"
+  | "drone"
+  | "vehicle"
+  | "camera"
+  | "gateway";
+export type DiscoverySourceCategory =
+  | "camera"
+  | "spatial"
+  | "telemetry"
+  | "state"
+  | "log";
+export type DiscoverySourceStatus = "ready" | "unavailable";
 
 export interface Integration {
   id: string;
@@ -123,6 +169,27 @@ export interface RecordingProjectSnapshot {
   dataAssignmentId: string;
 }
 
+/** Lossless RRD timeline metadata. start/end remain decimal strings across the JSON boundary. */
+export interface TimelineDescriptor {
+  name: string;
+  kind: TimelineKind;
+  start: string;
+  end: string;
+  durationSeconds: number | null;
+  fps: number | null;
+}
+
+export interface TimelineCursor {
+  kind: TimelineKind;
+  value: string;
+}
+
+export interface ReplayLoop {
+  mode: ReplayLoopMode;
+  start?: TimelineCursor;
+  end?: TimelineCursor;
+}
+
 export interface Recording {
   id: string;
   organizationId: string;
@@ -134,6 +201,12 @@ export interface Recording {
   rrdUrl: string;
   capturedAt: string;
   durationLabel: string;
+  timelines: TimelineDescriptor[];
+  defaultTimeline: string;
+  durationSeconds: number;
+  rrdVersion: string;
+  footerVerified: boolean;
+  contentSha256: string;
   topicIds: string[];
   mappingVersion: number;
   projectSnapshot: RecordingProjectSnapshot;
@@ -148,10 +221,98 @@ export interface ReplaySession {
   openedBy: string;
   status: "open" | "closed";
   streamUrl: string;
+  /** @deprecated Use initialCursor with initialTimeline. */
   cursorSeconds: number;
+  initialTimeline: string;
+  initialCursor: TimelineCursor;
+  initialPlayState: ReplayPlayState;
+  initialSpeed: number;
+  initialLoop: ReplayLoop;
   openedAt: string;
   closedAt?: string;
   resourceVersion: number;
+}
+
+export interface RecordingImport {
+  id: string;
+  projectId: string;
+  deviceId: string;
+  dataSourceId: string;
+  fileName: string;
+  format: RecordingImportFormat;
+  status: RecordingImportStatus;
+  progressPercent: number;
+  sizeBytes: number;
+  sourceSha256?: string;
+  failureReason?: string;
+  artifactUrl?: string;
+  recordingId?: string;
+  createdAt: string;
+  updatedAt: string;
+  resourceVersion: number;
+}
+
+/** A short-lived, user-initiated search. Discovered endpoints remain server-private. */
+export interface NetworkDiscoverySession {
+  id: string;
+  status: DiscoverySessionStatus;
+  candidateCount: number;
+  startedAt: string;
+  expiresAt: string;
+  resourceVersion: number;
+}
+
+/** A sanitized candidate summary. It intentionally contains no address or protocol details. */
+export interface DiscoveryCandidate {
+  id: string;
+  sessionId: string;
+  displayName: string;
+  category: DiscoveryCandidateCategory;
+  status: DiscoveryCandidateStatus;
+  lastSeenAt: string;
+  sourceCount: number;
+  supportsLive: boolean;
+}
+
+export interface NetworkDiscoverySnapshot {
+  session: NetworkDiscoverySession;
+  candidates: DiscoveryCandidate[];
+}
+
+export interface CandidateVerification {
+  verificationToken: string;
+  candidateId: string;
+  status: "verified" | "needs_credentials" | "incompatible" | "unavailable";
+  suggestedDevice: {
+    name: string;
+    kind: DeviceKind;
+  };
+  sources: Array<{
+    id: string;
+    label: string;
+    category: DiscoverySourceCategory;
+    status: DiscoverySourceStatus;
+  }>;
+  expiresAt: string;
+}
+
+export interface ApproveNetworkCandidateInput {
+  verificationToken: string;
+  projectId: string;
+  expectedWorkspaceVersion: number;
+  deviceName: string;
+  selectedSourceIds: string[];
+  accessMode: "observe";
+  visibility: "operator";
+}
+
+export interface NetworkLinkReceipt {
+  status: "linked";
+  projectId: string;
+  integrationId: string;
+  deviceId: string;
+  dataSourceIds: string[];
+  workspaceVersion: number;
 }
 
 /** A single Project Service revision, used instead of stitching mutable list responses together. */
@@ -164,6 +325,8 @@ export interface WorkspaceSnapshot {
   devices: Device[];
   dataSources: DataSource[];
   recordings: Recording[];
+  /** Immutable Topic descriptors captured with each Recording. Replay must never use live/source Topics. */
+  topicsByRecording: Record<string, Topic[]>;
   topicsByDataSource: Record<string, Topic[]>;
 }
 
@@ -292,7 +455,11 @@ export function deriveControlEligibility({
   if (device.status !== "online") {
     return { allowed: false, reason: "장비 연결을 확인해야 합니다." };
   }
-  if (device.health === "critical" || device.health === "restricted") {
+  if (
+    device.health === "unknown" ||
+    device.health === "critical" ||
+    device.health === "restricted"
+  ) {
     return { allowed: false, reason: "안전 상태를 먼저 확인해야 합니다." };
   }
   if (!viewerReady) {
@@ -309,6 +476,7 @@ export function deriveControlEligibility({
 
 export function healthLabel(health: DeviceHealth): string {
   return {
+    unknown: "확인 필요",
     normal: "정상",
     attention: "주의",
     restricted: "제한",
@@ -322,6 +490,16 @@ export function statusLabel(status: DeviceStatus): string {
     degraded: "지연됨",
     offline: "연결 끊김",
   }[status];
+}
+
+export function deviceKindLabel(kind: DeviceKind): string {
+  return {
+    robot: "로봇",
+    drone: "드론",
+    vehicle: "차량",
+    camera: "카메라",
+    gateway: "게이트웨이",
+  }[kind];
 }
 
 export function compactTimestamp(value: string): string {

@@ -9,6 +9,9 @@ use thiserror::Error;
 /// Where possible, the specialized error variants should be used.
 /// The [`Error::Other`] variant can be used in all other cases.
 pub enum Error {
+    #[error("MCAP decoding was cancelled")]
+    Cancelled,
+
     #[error("Channel {0} does not define a schema")]
     NoSchema(String),
 

@@ -49,7 +49,21 @@ Mock은 `VITE_RMS_USE_MOCK=true`인 경우에만 사용하며 기본 API 주소�
 
 운영 환경에서는 `/api`와 `/rerun`을 동일 origin으로 제공하고 `RMS_BACKEND_TARGET`으로 로컬 proxy 대상을 지정합니다.
 
+## 파일 가져오기
+
+`연동` 화면의 `파일 가져오기…`에서 프로젝트와 장비를 고른 뒤 RRD, MCAP, ROS 2 Bag ZIP, CSV 또는 MP4/MOV/WebM 영상을 선택합니다.
+업로드와 변환이 끝나면 해당 프로젝트의 `기록`에 Recording이 추가되고, 같은 화면에서 바로 `Replay 열기`로 이동할 수 있습니다.
+화면에는 업로드·처리·준비 상태만 표시하며 자세한 변환 오류는 서버 로그에 남깁니다.
+로컬 확인에는 `tests/assets/rms_import/telemetry.csv`를 사용할 수 있습니다.
+
 Replay API와 Runtime에는 제어 capability가 없으며 LIVE를 벗어날 때 보유 제어권을 반납합니다.
+
+Replay는 Rerun의 내장 Time Panel을 기본 축소 상태로 표시합니다.
+축소 바에서 재생, 일시정지, cursor 이동과 속도를 조작하고 RMS 하단의 `타임라인` 버튼으로 전체 데이터 Timeline을 펼칠 수 있습니다.
+초기 timeline, 손실 없는 cursor, play state, speed와 loop 정책은 ReplaySession에서 Rust Runtime으로 전달됩니다.
+
+LIVE 제어 capability는 DataSource가 `recording` 상태이고 세션과 필수 Topic이 모두 `fresh`일 때만 주입됩니다.
+프로젝트, 장비, Source 또는 Topic 상태가 바뀌면 Web host는 즉시 fail-closed context를 다시 적용합니다.
 
 ## 검증
 
@@ -57,6 +71,7 @@ Replay API와 Runtime에는 제어 capability가 없으며 LIVE를 벗어날 때
 npm test
 npm run build
 cargo nextest run --all-features --no-fail-fast -p rms_server -p rms_product_app
+target\debug\rerun.exe rrd verify tests\assets\rrd\rms\rms_replay_50s_v0_36_1.rrd
 ```
 
 Rust artifact 없이 React/TypeScript host만 검증하려면 `npm run build:host`를 사용합니다.

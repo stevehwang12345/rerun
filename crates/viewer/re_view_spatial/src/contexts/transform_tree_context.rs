@@ -255,13 +255,15 @@ impl ViewContextSystem for TransformTreeContext {
             let spatial_info_prop =
                 ViewProperty::from_archetype::<blueprint::archetypes::SpatialInformation>(ctx);
 
+            let target_frame_component_id =
+                blueprint::archetypes::SpatialInformation::descriptor_target_frame().component;
+            let has_explicit_target = spatial_info_prop
+                .component_raw(target_frame_component_id)
+                .is_some();
             let target_frame_component = spatial_info_prop
-                .component_or_fallback::<TransformFrameId>(
-                    ctx,
-                    blueprint::archetypes::SpatialInformation::descriptor_target_frame().component,
-                );
+                .component_or_fallback::<TransformFrameId>(ctx, target_frame_component_id);
 
-            match target_frame_component {
+            let mut target_frame = match target_frame_component {
                 Ok(target_frame) => {
                     let frame_id_hash = TransformFrameIdHash::from_str(target_frame.as_str());
 
@@ -280,7 +282,34 @@ impl ViewContextSystem for TransformTreeContext {
                     re_log::error_once!("Failed to query target frame: {err}");
                     self.transform_frame_id_for(query.space_origin.hash())
                 }
+            };
+
+            let is_implicit_space_origin =
+                target_frame == TransformFrameIdHash::from_entity_path(query.space_origin);
+            let space_origin_has_transform_data = static_execution_result
+                .child_frames_per_entity
+                .contains_key(&query.space_origin.hash());
+            if !has_explicit_target && is_implicit_space_origin && space_origin_has_transform_data {
+                // A transform-only ROS view has no CoordinateFrame entity from which to infer the
+                // target. Its Transform3D rows instead name explicit parent/child frames such as
+                // `map` and `odom`. Prefer a deterministic explicit transform-tree root so the
+                // axes do not get projected into the unrelated implicit `/` entity frame.
+                if let Some((root, _)) = self
+                    .transform_forest
+                    .transform_frame_roots()
+                    .filter_map(|root| {
+                        self.cache_frame_id_hash_mapping
+                            .get(&root)
+                            .map(|frame| (root, frame))
+                    })
+                    .filter(|(_, frame)| frame.as_entity_path().is_none())
+                    .min_by(|(_, left), (_, right)| left.as_str().cmp(right.as_str()))
+                {
+                    target_frame = root;
+                }
             }
+
+            target_frame
         };
 
         let latest_at_query = query.latest_at_query();
@@ -737,8 +766,9 @@ impl EntityTransformIdMapping {
 mod tests {
     use re_chunk_store::MissingChunkReporter;
     use re_log_types::{EntityPath, TimePoint};
-    use re_sdk_types::archetypes::CoordinateFrame;
+    use re_sdk_types::archetypes::{CoordinateFrame, Transform3D, TransformAxes3D};
     use re_test_context::TestContext;
+    use re_test_context::VisualizerBlueprintContext as _;
     use re_test_viewport::TestContextExt as _;
     use re_tf::{TransformFrameId, TransformFrameIdHash};
     use re_viewer_context::{
@@ -853,6 +883,58 @@ mod tests {
                     "Directly set target frame id should be resolvable via lookup_frame_id"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn transform_only_root_view_targets_an_explicit_transform_tree_root() {
+        let mut test_context = TestContext::new_with_view_class::<SpatialView3D>();
+        let class_id = SpatialView3D::identifier();
+
+        test_context.log_entity("tf_stream", |builder| {
+            builder.with_archetype_auto_row(
+                TimePoint::STATIC,
+                &Transform3D::new()
+                    .with_parent_frame("map")
+                    .with_child_frame("odom"),
+            )
+        });
+
+        let view_id = test_context.setup_viewport_blueprint(|ctx, blueprint| {
+            let view =
+                ViewBlueprint::new(class_id, RecommendedView::new_single_entity("tf_stream"));
+            let view_id = view.id;
+            blueprint.add_views(std::iter::once(view), None, None);
+            ctx.save_visualizers(
+                &EntityPath::from("tf_stream"),
+                view_id,
+                [&TransformAxes3D::new(0.25).with_show_frame(true)],
+            );
+            view_id
+        });
+
+        test_context.run_in_egui_central_panel(|ctx, _ui| {
+            let tree_context = execute_transform_tree_context(&test_context, ctx, view_id);
+            let roots = tree_context
+                .transform_forest()
+                .transform_frame_roots()
+                .map(|root| {
+                    (
+                        root,
+                        tree_context
+                            .lookup_frame_id(root)
+                            .map(|frame| frame.as_str().to_owned()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tree_context.target_frame(),
+                TransformFrameIdHash::from_str("map"),
+                "target={:?}, roots={roots:?}",
+                tree_context
+                    .lookup_frame_id(tree_context.target_frame())
+                    .map(|frame| frame.as_str())
+            );
         });
     }
 

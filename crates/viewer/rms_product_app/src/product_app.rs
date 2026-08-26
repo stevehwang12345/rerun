@@ -1,24 +1,32 @@
+use std::hash::{Hash as _, Hasher as _};
 use std::rc::Rc;
 
 use eframe::egui;
-use re_sdk_types::blueprint::components::{PanelState, PlayState};
+use re_sdk_types::blueprint::components::{LoopMode, PanelState, PlayState};
 use re_viewer::{CommandSender, PanelStateOverrides, SystemCommand, SystemCommandSender as _};
 use re_viewer_context::TimeControlCommand;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ViewerPreset {
     Operations,
+    Spatial,
     Camera,
     Diagnostics,
 }
 
 impl ViewerPreset {
-    const ALL: [Self; 3] = [Self::Operations, Self::Camera, Self::Diagnostics];
+    const ALL: [Self; 4] = [
+        Self::Operations,
+        Self::Spatial,
+        Self::Camera,
+        Self::Diagnostics,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Operations => "운영",
+            Self::Spatial => "공간",
             Self::Camera => "카메라",
             Self::Diagnostics => "진단",
         }
@@ -69,6 +77,17 @@ const CAMERA_TOPICS: [TopicSummary; 3] = [
     },
 ];
 
+const SPATIAL_TOPICS: [TopicSummary; 2] = [
+    TopicSummary {
+        label: "2D 지도",
+        value: "대기 중",
+    },
+    TopicSummary {
+        label: "3D 공간",
+        value: "대기 중",
+    },
+];
+
 const DIAGNOSTIC_TOPICS: [TopicSummary; 4] = [
     TopicSummary {
         label: "제어기",
@@ -87,6 +106,433 @@ const DIAGNOSTIC_TOPICS: [TopicSummary; 4] = [
         value: "3.1 GB",
     },
 ];
+
+const DEFAULT_VISIBLE_TOPIC_COUNT: usize = 8;
+const EMPTY_PRODUCT_QUERY: &str = "- /**";
+const BLUEPRINT_RETRY_BASE_MS: f64 = 1_000.0;
+const BLUEPRINT_RETRY_MAX_MS: f64 = 30_000.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlueprintPresetKey {
+    store_id: re_log_types::StoreId,
+    preset: ViewerPreset,
+    topics_hash: u64,
+}
+
+impl BlueprintPresetKey {
+    fn new(
+        store_id: re_log_types::StoreId,
+        preset: ViewerPreset,
+        topics: &[RmsTopicContext],
+    ) -> Self {
+        Self {
+            store_id,
+            preset,
+            topics_hash: product_topics_hash(preset, topics),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BlueprintDispatchRetry {
+    key: BlueprintPresetKey,
+    attempts: u8,
+    retry_after_ms: f64,
+}
+
+impl BlueprintDispatchRetry {
+    fn blocks(&self, key: &BlueprintPresetKey, now_ms: f64) -> bool {
+        self.key == *key && now_ms < self.retry_after_ms
+    }
+}
+
+fn blueprint_retry_delay_ms(attempts: u8) -> f64 {
+    let exponent = u32::from(attempts.saturating_sub(1).min(5));
+    (BLUEPRINT_RETRY_BASE_MS * f64::from(1_u32 << exponent)).min(BLUEPRINT_RETRY_MAX_MS)
+}
+
+fn record_blueprint_dispatch_failure(
+    dispatched_key: &mut Option<BlueprintPresetKey>,
+    retry: &mut Option<BlueprintDispatchRetry>,
+    key: BlueprintPresetKey,
+    now_ms: f64,
+) {
+    *dispatched_key = None;
+    let attempts = retry.as_ref().map_or(1, |previous| {
+        if previous.key == key {
+            previous.attempts.saturating_add(1)
+        } else {
+            1
+        }
+    });
+    *retry = Some(BlueprintDispatchRetry {
+        key,
+        attempts,
+        retry_after_ms: now_ms + blueprint_retry_delay_ms(attempts),
+    });
+}
+
+fn log_blueprint_dispatch_error(err: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    re_log::error!("Failed to dispatch RMS product blueprint: {err}");
+    #[cfg(target_arch = "wasm32")]
+    eprintln!("Failed to dispatch RMS product blueprint: {err}");
+}
+
+fn topic_matches_preset(preset: ViewerPreset, topic: &RmsTopicContext) -> bool {
+    match preset {
+        ViewerPreset::Operations => true,
+        ViewerPreset::Spatial => matches!(
+            topic.renderer.as_str(),
+            "spatial" | "spatial2d" | "spatial3d" | "transform3d" | "map"
+        ),
+        ViewerPreset::Camera => topic.renderer == "camera",
+        ViewerPreset::Diagnostics => {
+            matches!(
+                topic.renderer.as_str(),
+                "state" | "log" | "raw" | "timeseries"
+            )
+        }
+    }
+}
+
+fn canonical_product_topics(
+    preset: ViewerPreset,
+    topics: &[RmsTopicContext],
+) -> Vec<&RmsTopicContext> {
+    let mut topics = topics
+        .iter()
+        .filter(|topic| topic_matches_preset(preset, topic))
+        .collect::<Vec<_>>();
+    topics.sort_by(|left, right| {
+        (&left.renderer, &left.path, &left.label).cmp(&(&right.renderer, &right.path, &right.label))
+    });
+    topics.dedup_by(|left, right| {
+        left.renderer == right.renderer && left.path == right.path && left.label == right.label
+    });
+    topics
+}
+
+fn product_topics_hash(preset: ViewerPreset, topics: &[RmsTopicContext]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    preset.hash(&mut hasher);
+    for topic in canonical_product_topics(preset, topics) {
+        topic.renderer.hash(&mut hasher);
+        topic.path.hash(&mut hasher);
+        topic.label.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProductViewSpec {
+    name: String,
+    class_identifier: &'static str,
+    contents: Vec<String>,
+    space_origin: String,
+    transform_axes: Vec<String>,
+}
+
+fn topic_is_transform_tree(topic: &RmsTopicContext) -> bool {
+    topic
+        .path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| {
+            matches!(
+                segment.to_ascii_lowercase().as_str(),
+                "tf" | "tf_static" | "tf_drop"
+            )
+        })
+}
+
+fn product_view_specs(preset: ViewerPreset, topics: &[RmsTopicContext]) -> Vec<ProductViewSpec> {
+    let topics = canonical_product_topics(preset, topics);
+    let mut spatial_2d = Vec::new();
+    let mut spatial_3d = Vec::new();
+    let mut maps = Vec::new();
+    let mut cameras = Vec::new();
+    let mut timeseries = Vec::new();
+    let mut states = Vec::new();
+    let mut raw = Vec::new();
+    let mut logs = Vec::new();
+    for topic in topics {
+        match topic.renderer.as_str() {
+            "spatial2d" => spatial_2d.push(topic),
+            "spatial" | "spatial3d" | "transform3d" => spatial_3d.push(topic),
+            "map" => maps.push(topic),
+            "camera" => cameras.push(topic),
+            "timeseries" => timeseries.push(topic),
+            "state" => states.push(topic),
+            "log" => logs.push(topic),
+            // Unknown or newly introduced renderers must remain inspectable instead of silently
+            // becoming an empty TextLog view.
+            _ => raw.push(topic),
+        }
+    }
+
+    let paths = |topics: &[&RmsTopicContext]| {
+        topics
+            .iter()
+            .map(|topic| topic.path.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut views = Vec::new();
+    for spatial in spatial_2d {
+        views.push(ProductViewSpec {
+            name: format!("2D 공간 · {}", spatial.label),
+            class_identifier: "2D",
+            contents: vec![spatial.path.clone()],
+            // Grid maps and other 2D spatial archetypes commonly log a CoordinateFrame on the
+            // entity itself. Using that entity as the origin lets Rerun select the recorded frame
+            // instead of the unrelated implicit root frame.
+            space_origin: spatial.path.clone(),
+            transform_axes: Vec::new(),
+        });
+    }
+    let (transform_trees, spatial_geometry): (Vec<_>, Vec<_>) =
+        spatial_3d.into_iter().partition(|topic| {
+            topic.renderer == "transform3d"
+                || (topic.renderer == "spatial" && topic_is_transform_tree(topic))
+        });
+    for spatial in spatial_geometry {
+        views.push(ProductViewSpec {
+            name: format!("3D 공간 · {}", spatial.label),
+            class_identifier: "3D",
+            contents: vec![spatial.path.clone()],
+            // Explicit CoordinateFrame data is keyed by frame ID rather than by entity path.
+            // Giving every independent geometry entity its own target frame guarantees that a
+            // GridMap can render at the first sample, before a dynamic TF path to another frame
+            // has arrived. It also prevents unrelated devices' frame graphs from poisoning one
+            // shared spatial view.
+            space_origin: spatial.path.clone(),
+            transform_axes: Vec::new(),
+        });
+    }
+    if !transform_trees.is_empty() {
+        let transform_origin = transform_trees[0].path.clone();
+        views.push(ProductViewSpec {
+            name: "3D 좌표계".to_owned(),
+            class_identifier: "3D",
+            contents: paths(&transform_trees),
+            space_origin: transform_origin,
+            transform_axes: paths(&transform_trees),
+        });
+    }
+    if !maps.is_empty() {
+        views.push(ProductViewSpec {
+            name: "지도".to_owned(),
+            class_identifier: "Map",
+            contents: paths(&maps),
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    for camera in cameras {
+        views.push(ProductViewSpec {
+            name: camera.label.clone(),
+            class_identifier: "2D",
+            contents: vec![camera.path.clone()],
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    if !timeseries.is_empty() {
+        views.push(ProductViewSpec {
+            name: "시계열".to_owned(),
+            class_identifier: "TimeSeries",
+            contents: paths(&timeseries),
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    if !states.is_empty() {
+        views.push(ProductViewSpec {
+            name: "상태".to_owned(),
+            class_identifier: "StateTimeline",
+            contents: paths(&states),
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    if !raw.is_empty() {
+        views.push(ProductViewSpec {
+            name: "원시 데이터".to_owned(),
+            class_identifier: "Dataframe",
+            contents: paths(&raw),
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    if !logs.is_empty() {
+        views.push(ProductViewSpec {
+            name: "로그".to_owned(),
+            class_identifier: "TextLog",
+            contents: paths(&logs),
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+
+    if views.is_empty() {
+        views.push(ProductViewSpec {
+            name: "표시할 데이터 없음".to_owned(),
+            class_identifier: "2D",
+            contents: vec![EMPTY_PRODUCT_QUERY.to_owned()],
+            space_origin: "/".to_owned(),
+            transform_axes: Vec::new(),
+        });
+    }
+    views
+}
+
+fn append_blueprint_archetype(
+    messages: &mut Vec<re_log_types::LogMsg>,
+    blueprint_id: &re_log_types::StoreId,
+    entity_path: impl Into<re_log_types::EntityPath>,
+    archetype: &dyn re_sdk_types::AsComponents,
+) -> Result<(), String> {
+    let timepoint = re_log_types::TimePoint::default().with(
+        re_log_types::Timeline::new_sequence("blueprint"),
+        re_log_types::TimeInt::new_temporal(0),
+    );
+    let chunk = re_chunk::Chunk::builder(entity_path)
+        .with_archetype(re_chunk::RowId::new(), timepoint, archetype)
+        .build()
+        .map_err(|err| format!("Blueprint chunk creation failed: {err}"))?;
+    let arrow_msg = chunk
+        .to_arrow_msg()
+        .map_err(|err| format!("Blueprint chunk serialization failed: {err}"))?;
+    messages.push(re_log_types::LogMsg::ArrowMsg(
+        blueprint_id.clone(),
+        arrow_msg,
+    ));
+    Ok(())
+}
+
+fn product_blueprint_messages(
+    store_id: &re_log_types::StoreId,
+    preset: ViewerPreset,
+    topics: &[RmsTopicContext],
+) -> Result<Vec<re_log_types::LogMsg>, String> {
+    use re_sdk_types::archetypes::TransformAxes3D;
+    use re_sdk_types::blueprint::archetypes::{
+        ActiveVisualizers, ContainerBlueprint, ViewBlueprint, ViewContents, ViewportBlueprint,
+        VisualizerInstruction,
+    };
+    use re_sdk_types::blueprint::components::{
+        AutoLayout, AutoViews, ContainerKind, GridColumns, RootContainer, ViewClass,
+        VisualizerInstructionId,
+    };
+    use re_sdk_types::components::Name;
+    use re_sdk_types::datatypes::{Bool, Uuid};
+
+    let blueprint_id = re_log_types::StoreId::random(
+        re_log_types::StoreKind::Blueprint,
+        store_id.application_id().clone(),
+    );
+    let mut messages = vec![re_log_types::LogMsg::SetStoreInfo(
+        re_log_types::SetStoreInfo {
+            row_id: *re_chunk::RowId::new(),
+            info: re_log_types::StoreInfo::new(
+                blueprint_id.clone(),
+                re_log_types::StoreSource::Viewer,
+            ),
+        },
+    )];
+
+    let views = product_view_specs(preset, topics);
+    let mut view_paths = Vec::with_capacity(views.len());
+    for view in views {
+        let view_id = Uuid::random();
+        let view_path = format!("/view/{view_id}");
+        let contents = ViewContents::new(view.contents);
+        append_blueprint_archetype(
+            &mut messages,
+            &blueprint_id,
+            format!("{view_path}/ViewContents"),
+            &contents,
+        )?;
+        let view_blueprint = ViewBlueprint::new(ViewClass(view.class_identifier.into()))
+            .with_display_name(Name(view.name.into()))
+            .with_space_origin(view.space_origin);
+        append_blueprint_archetype(
+            &mut messages,
+            &blueprint_id,
+            view_path.clone(),
+            &view_blueprint,
+        )?;
+        for entity_path in view.transform_axes {
+            let entity_path = re_log_types::EntityPath::parse_strict(&entity_path)
+                .map_err(|err| format!("Invalid transform topic entity path: {err}"))?;
+            let override_base = ViewContents::blueprint_base_visualizer_path_for_entity(
+                view_id.into(),
+                &entity_path,
+            );
+            let visualizer_id = VisualizerInstructionId::new_deterministic(&entity_path, 0);
+            let visualizer_path = override_base.join(
+                &re_log_types::EntityPath::from_single_string(visualizer_id.to_string()),
+            );
+            append_blueprint_archetype(
+                &mut messages,
+                &blueprint_id,
+                visualizer_path.clone(),
+                &VisualizerInstruction::new("TransformAxes3D"),
+            )?;
+            append_blueprint_archetype(
+                &mut messages,
+                &blueprint_id,
+                visualizer_path,
+                &TransformAxes3D::new(0.25).with_show_frame(true),
+            )?;
+            append_blueprint_archetype(
+                &mut messages,
+                &blueprint_id,
+                override_base,
+                &ActiveVisualizers::new([visualizer_id]),
+            )?;
+        }
+        view_paths.push(view_path);
+    }
+
+    let root_id = Uuid::random();
+    let root_path = format!("/container/{root_id}");
+    let grid_columns = if view_paths.len() > 1 { 2 } else { 1 };
+    let root = ContainerBlueprint::new(ContainerKind::Grid)
+        .with_contents(view_paths)
+        .with_grid_columns(GridColumns(grid_columns.into()));
+    append_blueprint_archetype(&mut messages, &blueprint_id, root_path, &root)?;
+
+    let viewport = ViewportBlueprint::new()
+        .with_root_container(RootContainer(root_id))
+        .with_auto_layout(AutoLayout(Bool(false)))
+        .with_auto_views(AutoViews(Bool(false)));
+    append_blueprint_archetype(&mut messages, &blueprint_id, "/viewport", &viewport)?;
+    messages.push(re_log_types::LogMsg::BlueprintActivationCommand(
+        re_log_types::BlueprintActivationCommand {
+            blueprint_id,
+            make_active: true,
+            make_default: false,
+        },
+    ));
+
+    let activations = messages
+        .iter()
+        .filter_map(|message| match message {
+            re_log_types::LogMsg::BlueprintActivationCommand(command) => Some(command),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty()
+        || activations.len() != 1
+        || !activations[0].make_active
+        || activations[0].make_default
+    {
+        return Err("Blueprint stream is missing its non-default activation command".to_owned());
+    }
+    Ok(messages)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlCommand {
@@ -149,6 +595,56 @@ pub struct LiveViewerContext {
     pub topics: Vec<RmsTopicContext>,
 }
 
+/// Semantic kind of a cursor value supplied by the Replay service.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayTimeKind {
+    Sequence,
+    Timestamp,
+    Duration,
+}
+
+/// Lossless integer cursor supplied as a decimal string.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ReplayTimeValue {
+    pub kind: ReplayTimeKind,
+    pub value: String,
+}
+
+/// Initial Replay transport state.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayInitialPlayState {
+    #[default]
+    Paused,
+    Playing,
+}
+
+/// Initial Replay loop mode.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayInitialLoopMode {
+    #[default]
+    Off,
+    All,
+    Selection,
+}
+
+/// Initial Replay loop policy.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ReplayInitialLoop {
+    #[serde(default)]
+    pub mode: ReplayInitialLoopMode,
+    #[serde(default)]
+    pub start: Option<ReplayTimeValue>,
+    #[serde(default)]
+    pub end: Option<ReplayTimeValue>,
+}
+
+fn default_replay_speed() -> f32 {
+    1.0
+}
+
 /// Replay-service context.
 ///
 /// It intentionally contains neither operator identity nor a device-state version, because Replay
@@ -165,6 +661,18 @@ pub struct ReplayViewerContext {
     pub source_url: String,
     #[serde(default)]
     pub captured_at_label: Option<String>,
+    #[serde(default)]
+    pub initial_timeline: String,
+    #[serde(default)]
+    pub initial_fps: Option<f32>,
+    #[serde(default)]
+    pub initial_cursor: Option<ReplayTimeValue>,
+    #[serde(default)]
+    pub initial_play_state: ReplayInitialPlayState,
+    #[serde(default = "default_replay_speed")]
+    pub initial_speed: f32,
+    #[serde(default)]
+    pub initial_loop: ReplayInitialLoop,
     pub topics: Vec<RmsTopicContext>,
 }
 
@@ -505,9 +1013,16 @@ impl RetiredControlRequests {
 enum UiAction {
     OpenReplay,
     OpenLive,
+    ToggleReplayTimeline,
     ToggleLease,
     RequestCommand(ControlCommand),
     ConfirmCommand(ControlCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayInitializationStage {
+    ApplyPlaybackPolicy,
+    PlaybackPolicyApplied,
 }
 
 /// Product-owned RMS application that renders the operational shell and Rerun viewport together.
@@ -516,10 +1031,14 @@ pub struct RmsProductApp {
     egui_ctx: egui::Context,
     command_sender: CommandSender,
     preset: ViewerPreset,
+    show_all_topics: bool,
+    dispatched_blueprint_key: Option<BlueprintPresetKey>,
+    blueprint_dispatch_retry: Option<BlueprintDispatchRetry>,
     viewer_context: Option<ActiveViewerContext>,
     retired_control_requests: RetiredControlRequests,
     next_request_number: u64,
     pending_play_state: Option<PlayState>,
+    pending_replay_initialization: Option<ReplayInitializationStage>,
     waiting_for_source_change_from: Option<String>,
     host_event_sink: Option<RmsHostEventSink>,
     status_message: Option<String>,
@@ -577,10 +1096,14 @@ impl RmsProductApp {
             egui_ctx: creation_context.egui_ctx.clone(),
             command_sender,
             preset: ViewerPreset::Operations,
+            show_all_topics: false,
+            dispatched_blueprint_key: None,
+            blueprint_dispatch_retry: None,
             viewer_context: None,
             retired_control_requests: RetiredControlRequests::default(),
             next_request_number: 0,
             pending_play_state: source_url.map(|_| PlayState::Paused),
+            pending_replay_initialization: None,
             waiting_for_source_change_from: None,
             host_event_sink,
             status_message: None,
@@ -591,19 +1114,14 @@ impl RmsProductApp {
     fn topics(&self) -> &'static [TopicSummary] {
         match self.preset {
             ViewerPreset::Operations => &OPERATION_TOPICS,
+            ViewerPreset::Spatial => &SPATIAL_TOPICS,
             ViewerPreset::Camera => &CAMERA_TOPICS,
             ViewerPreset::Diagnostics => &DIAGNOSTIC_TOPICS,
         }
     }
 
     fn topic_matches_preset(&self, topic: &RmsTopicContext) -> bool {
-        match self.preset {
-            ViewerPreset::Operations => true,
-            ViewerPreset::Camera => topic.renderer == "camera",
-            ViewerPreset::Diagnostics => {
-                matches!(topic.renderer.as_str(), "state" | "log" | "timeseries")
-            }
-        }
+        topic_matches_preset(self.preset, topic)
     }
 
     fn matched_viewer_context(&self) -> Option<&ActiveViewerContext> {
@@ -691,15 +1209,83 @@ impl RmsProductApp {
     }
 
     fn send_time_command(&self, command: TimeControlCommand) {
+        self.send_time_commands(vec![command]);
+    }
+
+    fn send_time_commands(&self, commands: Vec<TimeControlCommand>) -> bool {
         let Some(store_id) = self.rerun_app.active_recording_id().cloned() else {
-            return;
+            return false;
         };
 
         self.command_sender
             .send_system(SystemCommand::TimeControlCommands {
                 store_id,
-                time_commands: vec![command],
+                time_commands: commands,
             });
+        true
+    }
+
+    fn dispatch_product_blueprint(
+        &mut self,
+        store_id: &re_log_types::StoreId,
+        preset: ViewerPreset,
+        topics: &[RmsTopicContext],
+    ) -> Result<(), String> {
+        let messages = product_blueprint_messages(store_id, preset, topics)?;
+        let (sender, receiver) = re_log_channel::log_channel(re_log_channel::LogSource::Sdk);
+        for message in messages {
+            sender
+                .send(re_log_channel::DataSourceMessage::LogMsg(message))
+                .map_err(|_err| "Blueprint log channel closed before dispatch".to_owned())?;
+        }
+        drop(sender);
+        self.rerun_app.add_log_receiver(receiver);
+        self.egui_ctx.request_repaint();
+        Ok(())
+    }
+
+    fn synchronize_product_blueprint(&mut self) {
+        let Some(store_id) = self.rerun_app.active_recording_id().cloned() else {
+            return;
+        };
+        let Some(context) = self.matched_viewer_context() else {
+            return;
+        };
+        if !self
+            .rerun_app
+            .active_recording_loaded_from_url(context.source_url())
+        {
+            return;
+        }
+        let topics = context.topics().to_vec();
+        let key = BlueprintPresetKey::new(store_id.clone(), self.preset, &topics);
+        if self.dispatched_blueprint_key.as_ref() == Some(&key) {
+            return;
+        }
+        let now_ms = current_time_ms();
+        if self
+            .blueprint_dispatch_retry
+            .as_ref()
+            .is_some_and(|retry| retry.blocks(&key, now_ms))
+        {
+            return;
+        }
+
+        // Claim the key before any channel callback can run, so one UI frame can never enqueue
+        // the same product blueprint twice.
+        self.dispatched_blueprint_key = Some(key.clone());
+        if let Err(err) = self.dispatch_product_blueprint(&store_id, self.preset, &topics) {
+            log_blueprint_dispatch_error(&err);
+            record_blueprint_dispatch_failure(
+                &mut self.dispatched_blueprint_key,
+                &mut self.blueprint_dispatch_retry,
+                key,
+                now_ms,
+            );
+            self.status_message = Some("뷰 구성을 잠시 후 다시 적용합니다.".to_owned());
+        } else {
+            self.blueprint_dispatch_retry = None;
+        }
     }
 
     fn open_source_if_changed(&mut self, source_url: &str, source_changed: bool) {
@@ -773,6 +1359,9 @@ impl RmsProductApp {
         control_event_sink: Option<RmsControlEventSink>,
     ) {
         self.shutdown_requested = false;
+        self.pending_replay_initialization = None;
+        self.rerun_app
+            .set_time_panel_override(Some(time_panel_state_for_live(true)));
         let control_event_sink = if context.control_enabled {
             control_event_sink
         } else {
@@ -861,11 +1450,18 @@ impl RmsProductApp {
             .as_ref()
             .is_none_or(|current| current.source_url() != context.source_url);
         let source_url = context.source_url.clone();
+        let should_initialize = !same_session || source_changed || source_url_changed;
 
         self.clear_active_context();
         self.viewer_context = Some(ActiveViewerContext::Replay(Box::new(context)));
         self.open_source_if_changed(&source_url, source_changed || source_url_changed);
-        self.pending_play_state = (!same_session).then_some(PlayState::Paused);
+        self.pending_play_state = None;
+        if should_initialize {
+            self.rerun_app
+                .set_time_panel_override(Some(time_panel_state_for_live(false)));
+            self.pending_replay_initialization =
+                Some(ReplayInitializationStage::ApplyPlaybackPolicy);
+        }
         self.status_message = None;
         self.egui_ctx.request_repaint();
     }
@@ -901,7 +1497,10 @@ impl RmsProductApp {
     pub fn apply_viewer_error(&mut self, message: String) {
         self.clear_active_context();
         self.pending_play_state = None;
+        self.pending_replay_initialization = None;
         self.waiting_for_source_change_from = None;
+        self.rerun_app
+            .set_time_panel_override(Some(PanelState::Hidden));
         self.status_message = Some(message);
         self.egui_ctx.request_repaint();
     }
@@ -977,6 +1576,16 @@ impl RmsProductApp {
         match action {
             UiAction::OpenReplay => self.request_open_replay(),
             UiAction::OpenLive => self.request_open_live(),
+            UiAction::ToggleReplayTimeline => {
+                if matches!(
+                    self.matched_viewer_context(),
+                    Some(ActiveViewerContext::Replay(_))
+                ) {
+                    let state =
+                        toggled_replay_time_panel_state(self.rerun_app.time_panel_override());
+                    self.rerun_app.set_time_panel_override(Some(state));
+                }
+            }
             UiAction::ToggleLease => {
                 let has_lease = self
                     .matched_live_session()
@@ -1243,18 +1852,53 @@ impl RmsProductApp {
         self.egui_ctx.request_repaint();
     }
 
+    fn synchronize_replay_initialization(&mut self) -> bool {
+        let Some(stage) = self.pending_replay_initialization else {
+            return false;
+        };
+        let Some(ActiveViewerContext::Replay(context)) = self.matched_viewer_context() else {
+            self.pending_replay_initialization = None;
+            return false;
+        };
+        if !self
+            .rerun_app
+            .active_recording_loaded_from_url(&context.source_url)
+        {
+            return true;
+        }
+
+        match stage {
+            ReplayInitializationStage::ApplyPlaybackPolicy => {
+                let commands = replay_initialization_commands(context);
+                if self.send_time_commands(commands) {
+                    self.pending_replay_initialization =
+                        Some(ReplayInitializationStage::PlaybackPolicyApplied);
+                }
+            }
+            ReplayInitializationStage::PlaybackPolicyApplied => {
+                // `rerun_app.logic` processed the ordered command batch before this callback.
+                self.pending_replay_initialization = None;
+            }
+        }
+        true
+    }
+
     fn synchronize_rerun_state(&mut self) {
-        let Some(active_recording_id) = self.rerun_app.active_recording_id() else {
+        let Some(_active_recording_id) = self.rerun_app.active_recording_id() else {
             return;
         };
-        if self
-            .waiting_for_source_change_from
-            .as_ref()
-            .is_some_and(|previous| previous == &active_recording_id.to_string())
-        {
+        if self.matched_viewer_context().is_some_and(|context| {
+            !self
+                .rerun_app
+                .active_recording_loaded_from_url(context.source_url())
+        }) {
             return;
         }
         self.waiting_for_source_change_from = None;
+
+        if self.synchronize_replay_initialization() {
+            return;
+        }
 
         if let Some(desired) = self.pending_play_state {
             if self.rerun_app.active_play_state() != Some(desired) {
@@ -1283,7 +1927,10 @@ impl RmsProductApp {
             }
             self.pending_play_state = Some(PlayState::Following);
             self.send_time_command(TimeControlCommand::SetPlayState(PlayState::Following));
+            return;
         }
+
+        self.synchronize_product_blueprint();
     }
 
     fn expire_control_lease(&mut self) {
@@ -1360,28 +2007,57 @@ impl RmsProductApp {
 
     fn topic_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("뷰");
+        let previous_preset = self.preset;
         ui.horizontal_wrapped(|ui| {
             for preset in ViewerPreset::ALL {
                 ui.selectable_value(&mut self.preset, preset, preset.label());
             }
         });
+        if self.preset != previous_preset {
+            self.show_all_topics = false;
+        }
         ui.separator();
         ui.strong("토픽");
         ui.add_space(4.0);
 
         if let Some(context) = self.matched_viewer_context() {
-            for topic in context
+            let topics = context
                 .topics()
                 .iter()
                 .filter(|topic| self.topic_matches_preset(topic))
-            {
-                ui.horizontal(|ui| {
-                    ui.label(&topic.label);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(topic.value.as_deref().unwrap_or("—"));
-                    });
+                .cloned()
+                .collect::<Vec<_>>();
+            let visible_count = if self.show_all_topics {
+                topics.len()
+            } else {
+                topics.len().min(DEFAULT_VISIBLE_TOPIC_COUNT)
+            };
+            egui::ScrollArea::vertical()
+                .max_height(176.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for topic in &topics[..visible_count] {
+                        ui.horizontal(|ui| {
+                            ui.label(&topic.label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.weak(topic.value.as_deref().unwrap_or("—"));
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                    }
                 });
-                ui.add_space(6.0);
+            if topics.len() > DEFAULT_VISIBLE_TOPIC_COUNT {
+                let label = if self.show_all_topics {
+                    "간단히 보기".to_owned()
+                } else {
+                    format!("{}개 더보기", topics.len() - DEFAULT_VISIBLE_TOPIC_COUNT)
+                };
+                if ui.small_button(label).clicked() {
+                    self.show_all_topics = !self.show_all_topics;
+                }
             }
         } else {
             for topic in self.topics() {
@@ -1479,6 +2155,21 @@ impl RmsProductApp {
                 action = Some(UiAction::OpenLive);
             }
             ui.separator();
+            let timeline_expanded = self
+                .rerun_app
+                .time_panel_override()
+                .is_some_and(|state| state.is_expanded());
+            if ui
+                .button(if timeline_expanded {
+                    "타임라인 접기"
+                } else {
+                    "타임라인"
+                })
+                .clicked()
+            {
+                action = Some(UiAction::ToggleReplayTimeline);
+            }
+            ui.separator();
             ui.strong(&context.recording_name);
             if let Some(captured_at) = &context.captured_at_label {
                 ui.weak(captured_at);
@@ -1533,6 +2224,91 @@ impl RmsProductApp {
         }
         action
     }
+}
+
+fn time_panel_state_for_live(is_live: bool) -> PanelState {
+    if is_live {
+        PanelState::Hidden
+    } else {
+        PanelState::Collapsed
+    }
+}
+
+fn toggled_replay_time_panel_state(current: Option<PanelState>) -> PanelState {
+    if current.is_some_and(|state| state.is_expanded()) {
+        PanelState::Collapsed
+    } else {
+        PanelState::Expanded
+    }
+}
+
+fn replay_time_value(value: &ReplayTimeValue) -> Option<i64> {
+    value.value.parse().ok()
+}
+
+fn replay_initialization_commands(context: &ReplayViewerContext) -> Vec<TimeControlCommand> {
+    use re_viewer_context::external::re_log_types::{AbsoluteTimeRange, TimeReal, TimelineName};
+
+    let mut commands = Vec::with_capacity(8);
+    if let Ok(timeline) = TimelineName::try_new(&context.initial_timeline) {
+        commands.push(TimeControlCommand::SetActiveTimeline(timeline));
+    }
+    let initial_fps = context
+        .initial_fps
+        .filter(|fps| fps.is_finite() && *fps > 0.0);
+    if let Some(fps) = initial_fps {
+        commands.push(TimeControlCommand::SetFps(fps));
+    }
+    if let Some(cursor) = context.initial_cursor.as_ref().and_then(replay_time_value) {
+        commands.push(TimeControlCommand::SetTime(TimeReal::from(cursor)));
+    }
+
+    let sequence_without_valid_fps = context
+        .initial_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.kind == ReplayTimeKind::Sequence)
+        && initial_fps.is_none();
+    commands.push(TimeControlCommand::SetPlayState(
+        match (context.initial_play_state, sequence_without_valid_fps) {
+            (_, true) | (ReplayInitialPlayState::Paused, false) => PlayState::Paused,
+            (ReplayInitialPlayState::Playing, false) => PlayState::Playing,
+        },
+    ));
+    let speed = if context.initial_speed.is_finite() && context.initial_speed > 0.0 {
+        context.initial_speed
+    } else {
+        default_replay_speed()
+    };
+    commands.push(TimeControlCommand::SetSpeed(speed));
+
+    match context.initial_loop.mode {
+        ReplayInitialLoopMode::Off => {
+            commands.push(TimeControlCommand::SetLoopMode(LoopMode::Off));
+        }
+        ReplayInitialLoopMode::All => {
+            commands.push(TimeControlCommand::SetLoopMode(LoopMode::All));
+        }
+        ReplayInitialLoopMode::Selection => {
+            let selection = context
+                .initial_loop
+                .start
+                .as_ref()
+                .zip(context.initial_loop.end.as_ref())
+                .filter(|(start, end)| start.kind == end.kind)
+                .and_then(|(start, end)| replay_time_value(start).zip(replay_time_value(end)))
+                .filter(|(start, end)| start <= end);
+            if let Some((start, end)) = selection {
+                commands.push(TimeControlCommand::SetTimeSelection(
+                    AbsoluteTimeRange::new(start, end),
+                ));
+                commands.push(TimeControlCommand::SetLoopMode(LoopMode::Selection));
+            } else {
+                commands.push(TimeControlCommand::SetLoopMode(LoopMode::Off));
+            }
+        }
+    }
+
+    commands
 }
 
 #[expect(
@@ -1687,14 +2463,18 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use re_sdk_types::blueprint::components::PlayState;
+    use re_sdk_types::blueprint::components::{LoopMode, PanelState, PlayState};
 
     use super::{
-        ActiveViewerContext, ControlCapabilityUpdate, ControlLease, LiveControlCapability,
-        LiveSession, LiveViewerContext, PendingControlKind, PendingControlRequest,
-        ReplayViewerContext, RetiredControlRequests, RmsControlEvent, RmsTopicContext,
-        SourceTransitionState, control_capability_was_revoked, control_is_allowed,
-        source_transition_is_ready,
+        ActiveViewerContext, BlueprintPresetKey, ControlCapabilityUpdate, ControlLease,
+        EMPTY_PRODUCT_QUERY, LiveControlCapability, LiveSession, LiveViewerContext,
+        PendingControlKind, PendingControlRequest, ReplayInitialLoop, ReplayInitialLoopMode,
+        ReplayInitialPlayState, ReplayTimeKind, ReplayTimeValue, ReplayViewerContext,
+        RetiredControlRequests, RmsControlEvent, RmsTopicContext, SourceTransitionState,
+        TimeControlCommand, ViewerPreset, blueprint_retry_delay_ms, control_capability_was_revoked,
+        control_is_allowed, product_blueprint_messages, product_topics_hash, product_view_specs,
+        record_blueprint_dispatch_failure, replay_initialization_commands,
+        source_transition_is_ready, time_panel_state_for_live, toggled_replay_time_panel_state,
     };
 
     fn live_context() -> LiveViewerContext {
@@ -1732,6 +2512,15 @@ mod tests {
             replay_session_id: "replay-session-1".to_owned(),
             source_url: "https://example.invalid/replay.rrd".to_owned(),
             captured_at_label: None,
+            initial_timeline: "tick".to_owned(),
+            initial_fps: Some(2.0),
+            initial_cursor: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Sequence,
+                value: "0".to_owned(),
+            }),
+            initial_play_state: ReplayInitialPlayState::Paused,
+            initial_speed: 1.0,
+            initial_loop: ReplayInitialLoop::default(),
             topics: Vec::new(),
         }
     }
@@ -1751,6 +2540,370 @@ mod tests {
         let context = ActiveViewerContext::Replay(Box::new(replay_context()));
         assert!(matches!(context, ActiveViewerContext::Replay(_)));
         assert_eq!(context.badge(), "REPLAY");
+    }
+
+    #[test]
+    fn product_blueprint_key_is_order_independent_and_source_scoped() {
+        let store_id =
+            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "rms-blueprint-test");
+        let topics = vec![
+            RmsTopicContext {
+                label: "Camera".to_owned(),
+                path: "/camera/front".to_owned(),
+                renderer: "camera".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Pose".to_owned(),
+                path: "/pose".to_owned(),
+                renderer: "spatial".to_owned(),
+                value: None,
+            },
+        ];
+        let mut reversed = topics.clone();
+        reversed.reverse();
+        let key = BlueprintPresetKey::new(store_id.clone(), ViewerPreset::Operations, &topics);
+        assert_eq!(
+            key,
+            BlueprintPresetKey::new(store_id.clone(), ViewerPreset::Operations, &reversed)
+        );
+        assert_ne!(
+            key,
+            BlueprintPresetKey::new(store_id, ViewerPreset::Camera, &topics)
+        );
+        assert_ne!(
+            key,
+            BlueprintPresetKey::new(
+                re_log_types::StoreId::random(
+                    re_log_types::StoreKind::Recording,
+                    "rms-blueprint-test"
+                ),
+                ViewerPreset::Operations,
+                &topics,
+            )
+        );
+    }
+
+    #[test]
+    fn spatial_preset_separates_2d_content_from_3d_geometry_and_accepts_legacy_alias() {
+        let topics = vec![
+            RmsTopicContext {
+                label: "Map".to_owned(),
+                path: "/map".to_owned(),
+                renderer: "spatial2d".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Costmap".to_owned(),
+                path: "/local_costmap/costmap".to_owned(),
+                renderer: "spatial2d".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Transforms".to_owned(),
+                path: "/tf".to_owned(),
+                renderer: "spatial".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Legacy pose".to_owned(),
+                path: "/pose".to_owned(),
+                renderer: "spatial".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Camera".to_owned(),
+                path: "/camera/front".to_owned(),
+                renderer: "camera".to_owned(),
+                value: None,
+            },
+        ];
+
+        let views = product_view_specs(ViewerPreset::Spatial, &topics);
+        assert_eq!(views.len(), 4);
+        assert_eq!(views[0].class_identifier, "2D");
+        assert_eq!(views[0].space_origin, "/local_costmap/costmap");
+        assert_eq!(views[0].contents, ["/local_costmap/costmap"]);
+        assert_eq!(views[1].class_identifier, "2D");
+        assert_eq!(views[1].space_origin, "/map");
+        assert_eq!(views[1].contents, ["/map"]);
+        assert_eq!(views[2].class_identifier, "3D");
+        assert_eq!(views[2].space_origin, "/pose");
+        assert_eq!(views[2].contents, ["/pose"]);
+        assert!(views[2].transform_axes.is_empty());
+        assert_eq!(views[3].class_identifier, "3D");
+        assert_eq!(views[3].space_origin, "/tf");
+        assert_eq!(views[3].contents, ["/tf"]);
+        assert_eq!(views[3].transform_axes, ["/tf"]);
+        assert!(
+            views
+                .iter()
+                .flat_map(|view| &view.contents)
+                .all(|path| path != "/camera/front")
+        );
+    }
+
+    #[test]
+    fn grid_maps_use_independent_3d_origins_before_dynamic_tf_arrives() {
+        let topics = [
+            RmsTopicContext {
+                label: "costmap".to_owned(),
+                path: "/local_costmap/costmap".to_owned(),
+                renderer: "spatial3d".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "map".to_owned(),
+                path: "/map".to_owned(),
+                renderer: "spatial3d".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "tf drop".to_owned(),
+                path: "/tf_drop".to_owned(),
+                renderer: "transform3d".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "tf static".to_owned(),
+                path: "/tf_static".to_owned(),
+                renderer: "transform3d".to_owned(),
+                value: None,
+            },
+        ];
+
+        let views = product_view_specs(ViewerPreset::Spatial, &topics);
+
+        assert_eq!(views.len(), 3);
+        assert_eq!(views[0].class_identifier, "3D");
+        assert_eq!(views[0].contents, ["/local_costmap/costmap"]);
+        assert_eq!(views[0].space_origin, "/local_costmap/costmap");
+        assert_eq!(views[1].class_identifier, "3D");
+        assert_eq!(views[1].contents, ["/map"]);
+        assert_eq!(views[1].space_origin, "/map");
+        assert_eq!(views[2].class_identifier, "3D");
+        assert_eq!(views[2].contents, ["/tf_drop", "/tf_static"]);
+        assert_eq!(views[2].space_origin, "/tf_drop");
+        assert_eq!(views[2].transform_axes, ["/tf_drop", "/tf_static"]);
+    }
+
+    #[test]
+    fn raw_ros_archetypes_use_dataframe_instead_of_an_empty_text_log_view() {
+        let topics = [
+            RmsTopicContext {
+                label: "odometry".to_owned(),
+                path: "/direct_laser_odometry/odom".to_owned(),
+                renderer: "raw".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "laser scan".to_owned(),
+                path: "/scan_raw".to_owned(),
+                renderer: "raw".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "rosout".to_owned(),
+                path: "/rosout".to_owned(),
+                renderer: "log".to_owned(),
+                value: None,
+            },
+        ];
+
+        let views = product_view_specs(ViewerPreset::Diagnostics, &topics);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].class_identifier, "Dataframe");
+        assert_eq!(
+            views[0].contents,
+            ["/direct_laser_odometry/odom", "/scan_raw"]
+        );
+        assert_eq!(views[1].class_identifier, "TextLog");
+        assert_eq!(views[1].contents, ["/rosout"]);
+    }
+
+    #[test]
+    fn map_and_unknown_renderers_keep_data_visible_in_safe_views() {
+        let topics = [
+            RmsTopicContext {
+                label: "GPS".to_owned(),
+                path: "/fix".to_owned(),
+                renderer: "map".to_owned(),
+                value: None,
+            },
+            RmsTopicContext {
+                label: "Future payload".to_owned(),
+                path: "/future".to_owned(),
+                renderer: "future_renderer".to_owned(),
+                value: None,
+            },
+        ];
+
+        let views = product_view_specs(ViewerPreset::Operations, &topics);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].class_identifier, "Map");
+        assert_eq!(views[0].contents, ["/fix"]);
+        assert_eq!(views[1].class_identifier, "Dataframe");
+        assert_eq!(views[1].contents, ["/future"]);
+    }
+
+    #[test]
+    fn spatial_geometry_under_a_transforms_path_is_not_mistaken_for_tf() {
+        let points = RmsTopicContext {
+            label: "Point cloud".to_owned(),
+            path: "/transforms/points".to_owned(),
+            renderer: "spatial3d".to_owned(),
+            value: None,
+        };
+
+        let views = product_view_specs(ViewerPreset::Spatial, &[points]);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].contents, ["/transforms/points"]);
+        assert_eq!(views[0].space_origin, "/transforms/points");
+        assert!(views[0].transform_axes.is_empty());
+    }
+
+    #[test]
+    fn a_single_3d_geometry_topic_uses_its_entity_as_space_origin() {
+        let points = RmsTopicContext {
+            label: "Point cloud".to_owned(),
+            path: "/lidar/points".to_owned(),
+            renderer: "spatial3d".to_owned(),
+            value: None,
+        };
+        let views = product_view_specs(ViewerPreset::Spatial, &[points]);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].class_identifier, "3D");
+        assert_eq!(views[0].space_origin, "/lidar/points");
+        assert!(views[0].transform_axes.is_empty());
+    }
+
+    #[test]
+    fn transform_tree_blueprint_explicitly_enables_transform_axes() -> Result<(), String> {
+        let store_id =
+            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "rms-spatial-test");
+        let tf = RmsTopicContext {
+            label: "TF".to_owned(),
+            path: "/robot/base".to_owned(),
+            renderer: "transform3d".to_owned(),
+            value: None,
+        };
+        let messages = product_blueprint_messages(&store_id, ViewerPreset::Spatial, &[tf])?;
+        let entity_paths = messages
+            .iter()
+            .filter_map(|message| match message {
+                re_log_types::LogMsg::ArrowMsg(_, arrow_msg) => {
+                    re_chunk::Chunk::from_arrow_msg(arrow_msg).ok()
+                }
+                _ => None,
+            })
+            .map(|chunk| chunk.entity_path().to_string())
+            .collect::<Vec<_>>();
+
+        let visualizer_path_fragment = "/ViewContents/overrides/robot/base/visualizers/";
+        assert_eq!(
+            entity_paths
+                .iter()
+                .filter(|path| path.contains(visualizer_path_fragment))
+                .count(),
+            2,
+            "the instruction and its TransformAxes3D overrides must both be logged"
+        );
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| { path.ends_with("/ViewContents/overrides/robot/base/visualizers") })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blueprint_channel_contains_only_blueprint_messages_and_non_default_activation()
+    -> Result<(), String> {
+        let store_id =
+            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "rms-blueprint-test");
+        let messages = product_blueprint_messages(&store_id, ViewerPreset::Camera, &[])?;
+        assert!(
+            messages
+                .iter()
+                .all(|message| { message.store_id().kind() == re_log_types::StoreKind::Blueprint })
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| { matches!(message, re_log_types::LogMsg::ArrowMsg(..)) }),
+            "zero-topic preset must still log an explicit empty view"
+        );
+        let activation = messages
+            .iter()
+            .find_map(|message| match message {
+                re_log_types::LogMsg::BlueprintActivationCommand(command) => Some(command),
+                _ => None,
+            })
+            .ok_or_else(|| "missing activation".to_owned())?;
+        assert!(activation.make_active);
+        assert!(!activation.make_default);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_topic_presets_do_not_fall_back_to_unmatched_topics() {
+        let spatial = RmsTopicContext {
+            label: "Pose".to_owned(),
+            path: "/pose".to_owned(),
+            renderer: "spatial".to_owned(),
+            value: None,
+        };
+        assert_eq!(
+            product_topics_hash(ViewerPreset::Camera, &[spatial]),
+            product_topics_hash(ViewerPreset::Camera, &[])
+        );
+
+        let filter = re_log_types::EntityPathFilter::parse_strict(EMPTY_PRODUCT_QUERY)
+            .expect("empty product query must use valid filter grammar")
+            .resolve_without_substitutions();
+        assert!(!filter.matches(
+            &re_log_types::EntityPath::parse_strict("/pose").expect("valid test entity path")
+        ));
+        assert!(
+            !filter.matches(
+                &re_log_types::EntityPath::parse_strict("/camera/front")
+                    .expect("valid test entity path")
+            )
+        );
+    }
+
+    #[test]
+    fn blueprint_dispatch_failure_rolls_back_claim_and_uses_bounded_backoff() {
+        let store_id = re_log_types::StoreId::random(
+            re_log_types::StoreKind::Recording,
+            "rms-blueprint-retry-test",
+        );
+        let key = BlueprintPresetKey::new(store_id, ViewerPreset::Operations, &[]);
+        let mut dispatched_key = Some(key.clone());
+        let mut retry = None;
+
+        record_blueprint_dispatch_failure(&mut dispatched_key, &mut retry, key.clone(), 10_000.0);
+        assert!(dispatched_key.is_none());
+        let first = retry.as_ref().expect("failure must install a retry latch");
+        assert_eq!(first.attempts, 1);
+        assert!(first.blocks(&key, 10_999.0));
+        assert!(!first.blocks(&key, 11_000.0));
+
+        dispatched_key = Some(key.clone());
+        record_blueprint_dispatch_failure(&mut dispatched_key, &mut retry, key.clone(), 11_000.0);
+        assert!(dispatched_key.is_none());
+        let second = retry.as_ref().expect("retry latch remains installed");
+        assert_eq!(second.attempts, 2);
+        assert_eq!(second.retry_after_ms, 13_000.0);
+        assert_eq!(blueprint_retry_delay_ms(u8::MAX), 30_000.0);
+
+        let other_key =
+            BlueprintPresetKey::new(key.store_id.clone(), ViewerPreset::Diagnostics, &[]);
+        assert!(!second.blocks(&other_key, 11_001.0));
     }
 
     #[test]
@@ -1818,6 +2971,170 @@ mod tests {
             play_state: Some(PlayState::Following),
             active_source_matches: true,
         }));
+    }
+
+    #[test]
+    fn time_panel_transitions_replay_collapsed_to_expanded_then_live_hidden() {
+        let mut state = time_panel_state_for_live(false);
+        assert_eq!(state, PanelState::Collapsed);
+        state = toggled_replay_time_panel_state(Some(state));
+        assert_eq!(state, PanelState::Expanded);
+        state = time_panel_state_for_live(true);
+        assert_eq!(state, PanelState::Hidden);
+    }
+
+    #[test]
+    fn replay_initialization_commands_preserve_contract_order() {
+        let commands = replay_initialization_commands(&replay_context());
+        assert_eq!(commands.len(), 6);
+        assert!(matches!(
+            &commands[0],
+            TimeControlCommand::SetActiveTimeline(timeline) if timeline.as_str() == "tick"
+        ));
+        assert!(matches!(&commands[1], TimeControlCommand::SetFps(2.0)));
+        assert!(matches!(
+            &commands[2],
+            TimeControlCommand::SetTime(time) if time.floor().as_i64() == 0
+        ));
+        assert!(matches!(
+            &commands[3],
+            TimeControlCommand::SetPlayState(PlayState::Paused)
+        ));
+        assert!(matches!(&commands[4], TimeControlCommand::SetSpeed(1.0)));
+        assert!(matches!(
+            &commands[5],
+            TimeControlCommand::SetLoopMode(LoopMode::Off)
+        ));
+    }
+
+    #[test]
+    fn invalid_replay_selection_and_speed_fail_safe() {
+        let mut context = replay_context();
+        context.initial_speed = f32::NAN;
+        context.initial_loop = ReplayInitialLoop {
+            mode: ReplayInitialLoopMode::Selection,
+            start: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Sequence,
+                value: "100".to_owned(),
+            }),
+            end: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Timestamp,
+                value: "0".to_owned(),
+            }),
+        };
+
+        let commands = replay_initialization_commands(&context);
+        assert!(matches!(&commands[4], TimeControlCommand::SetSpeed(1.0)));
+        assert!(matches!(
+            &commands[5],
+            TimeControlCommand::SetLoopMode(LoopMode::Off)
+        ));
+    }
+
+    #[test]
+    fn invalid_sequence_fps_prevents_autoplay_at_the_rerun_default() {
+        for invalid_fps in [None, Some(f32::NAN), Some(0.0), Some(-2.0)] {
+            let mut context = replay_context();
+            context.initial_fps = invalid_fps;
+            context.initial_play_state = ReplayInitialPlayState::Playing;
+
+            let commands = replay_initialization_commands(&context);
+            assert!(
+                !commands
+                    .iter()
+                    .any(|command| matches!(command, TimeControlCommand::SetFps(_)))
+            );
+            assert!(commands.iter().any(|command| matches!(
+                command,
+                TimeControlCommand::SetPlayState(PlayState::Paused)
+            )));
+        }
+    }
+
+    #[test]
+    fn timestamp_replay_can_play_without_an_fps_override() {
+        let mut context = replay_context();
+        context.initial_fps = None;
+        context.initial_cursor = Some(ReplayTimeValue {
+            kind: ReplayTimeKind::Timestamp,
+            value: "1767225600000000000".to_owned(),
+        });
+        context.initial_play_state = ReplayInitialPlayState::Playing;
+
+        let commands = replay_initialization_commands(&context);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            TimeControlCommand::SetPlayState(PlayState::Playing)
+        )));
+    }
+
+    #[test]
+    fn duration_replay_preserves_nanoseconds_and_can_play_without_fps() {
+        let mut context = replay_context();
+        context.initial_fps = None;
+        context.initial_cursor = Some(ReplayTimeValue {
+            kind: ReplayTimeKind::Duration,
+            value: "1500000000".to_owned(),
+        });
+        context.initial_play_state = ReplayInitialPlayState::Playing;
+        context.initial_loop = ReplayInitialLoop {
+            mode: ReplayInitialLoopMode::Selection,
+            start: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Duration,
+                value: "500000000".to_owned(),
+            }),
+            end: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Duration,
+                value: "2000000000".to_owned(),
+            }),
+        };
+
+        let commands = replay_initialization_commands(&context);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            TimeControlCommand::SetTime(time) if time.floor().as_i64() == 1_500_000_000
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            TimeControlCommand::SetPlayState(PlayState::Playing)
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            TimeControlCommand::SetTimeSelection(range)
+                if range.min().as_i64() == 500_000_000
+                    && range.max().as_i64() == 2_000_000_000
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            TimeControlCommand::SetLoopMode(LoopMode::Selection)
+        )));
+    }
+
+    #[test]
+    fn replay_selection_is_applied_before_selection_loop_mode() {
+        let mut context = replay_context();
+        context.initial_loop = ReplayInitialLoop {
+            mode: ReplayInitialLoopMode::Selection,
+            start: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Sequence,
+                value: "10".to_owned(),
+            }),
+            end: Some(ReplayTimeValue {
+                kind: ReplayTimeKind::Sequence,
+                value: "20".to_owned(),
+            }),
+        };
+
+        let commands = replay_initialization_commands(&context);
+        assert!(matches!(
+            &commands[5],
+            TimeControlCommand::SetTimeSelection(range)
+                if range.min().as_i64() == 10 && range.max().as_i64() == 20
+        ));
+        assert!(matches!(
+            &commands[6],
+            TimeControlCommand::SetLoopMode(LoopMode::Selection)
+        ));
     }
 
     #[test]

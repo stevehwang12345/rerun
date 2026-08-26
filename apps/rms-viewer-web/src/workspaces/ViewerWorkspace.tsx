@@ -7,8 +7,13 @@ import type {
   Device,
   LiveSession,
   Recording,
+  ReplayLoop,
+  ReplayPlayState,
   ReplaySession,
   RmsEvent,
+  TimelineCursor,
+  TimelineDescriptor,
+  TimelineKind,
   Topic,
   WorkspaceSnapshot,
 } from "../domain";
@@ -16,6 +21,7 @@ import { livePath, projectsPath, replayPath, type RmsRoute } from "../routes";
 
 const RUNTIME_MODULE_URL = "/runtime/rms_product_app.js";
 const RUNTIME_WASM_URL = "/runtime/rms_product_app_bg.wasm";
+export const VIEWER_FAILURE_MESSAGE = "화면을 불러오지 못했습니다";
 
 interface RmsTopicContext {
   label: string;
@@ -51,6 +57,12 @@ interface ReplayViewerContext {
   replay_session_id: string;
   source_url: string;
   captured_at_label?: string;
+  initial_timeline: string;
+  initial_cursor: TimelineCursor;
+  initial_play_state: ReplayPlayState;
+  initial_fps: number | null;
+  initial_speed: number;
+  initial_loop: ReplayLoop;
   topics: RmsTopicContext[];
 }
 
@@ -138,16 +150,16 @@ interface RmsProductRuntimeModule {
   RmsWebHandle: new () => RmsWebHandle;
 }
 
-interface ResolvedLive {
+export interface ResolvedLive {
   kind: "live";
   workspace: WorkspaceSnapshot;
   device: Device;
   session: LiveSession;
   topics: Topic[];
-  sourceName: string;
+  source: DataSource;
 }
 
-interface ResolvedReplay {
+export interface ResolvedReplay {
   kind: "replay";
   workspace: WorkspaceSnapshot;
   device: Device;
@@ -156,7 +168,7 @@ interface ResolvedReplay {
   topics: Topic[];
 }
 
-type ResolvedSession = ResolvedLive | ResolvedReplay;
+export type ResolvedSession = ResolvedLive | ResolvedReplay;
 
 let runtimeModulePromise: Promise<RmsProductRuntimeModule> | undefined;
 
@@ -250,19 +262,186 @@ export function commandIdempotencyKey(runtimeNonce: string, requestId: string): 
   return `${runtimeNonce}:${requestId}`;
 }
 
+export interface ReplayPlaybackContext {
+  initial_timeline: string;
+  initial_cursor: TimelineCursor;
+  initial_play_state: ReplayPlayState;
+  initial_fps: number | null;
+  initial_speed: number;
+  initial_loop: ReplayLoop;
+}
+
+type ReplayPlaybackSource = Pick<ReplaySession, "cursorSeconds"> &
+  Partial<
+    Pick<
+      ReplaySession,
+      | "initialTimeline"
+      | "initialCursor"
+      | "initialPlayState"
+      | "initialSpeed"
+      | "initialLoop"
+    >
+  >;
+
+function decimalInteger(value: unknown): bigint | undefined {
+  if (typeof value !== "string" || !/^-?\d+$/.test(value)) return undefined;
+  try {
+    return BigInt(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function isTimelineKind(value: unknown): value is TimelineKind {
+  return value === "sequence" || value === "timestamp" || value === "duration";
+}
+
+function validTimeline(timeline: TimelineDescriptor): boolean {
+  const start = decimalInteger(timeline.start);
+  const end = decimalInteger(timeline.end);
+  return (
+    timeline.name.trim().length > 0 &&
+    isTimelineKind(timeline.kind) &&
+    start != null &&
+    end != null &&
+    start <= end &&
+    (timeline.durationSeconds == null ||
+      (Number.isFinite(timeline.durationSeconds) && timeline.durationSeconds >= 0)) &&
+    (timeline.fps == null || (Number.isFinite(timeline.fps) && timeline.fps > 0))
+  );
+}
+
+function clampCursorValue(value: bigint, timeline: TimelineDescriptor): string {
+  const start = decimalInteger(timeline.start) ?? 0n;
+  const end = decimalInteger(timeline.end) ?? start;
+  return (value < start ? start : value > end ? end : value).toString();
+}
+
+function cursorOnTimeline(
+  cursor: TimelineCursor | undefined,
+  timeline: TimelineDescriptor,
+): TimelineCursor | undefined {
+  if (!cursor || cursor.kind !== timeline.kind) return undefined;
+  const value = decimalInteger(cursor.value);
+  return value == null
+    ? undefined
+    : { kind: timeline.kind, value: clampCursorValue(value, timeline) };
+}
+
+function legacyCursor(timeline: TimelineDescriptor, cursorSeconds: number): TimelineCursor {
+  const start = decimalInteger(timeline.start) ?? 0n;
+  const seconds = Number.isFinite(cursorSeconds) && cursorSeconds > 0 ? cursorSeconds : 0;
+  const numericOffset =
+    timeline.kind === "timestamp" || timeline.kind === "duration"
+      ? Math.round(seconds * 1_000_000_000)
+      : Math.round(seconds * (timeline.fps ?? 1));
+  const offset = Number.isSafeInteger(numericOffset) ? BigInt(numericOffset) : 0n;
+  return {
+    kind: timeline.kind,
+    value: clampCursorValue(start + offset, timeline),
+  };
+}
+
+function normalizedLoop(loop: ReplayLoop | undefined, timeline: TimelineDescriptor): ReplayLoop {
+  if (loop?.mode === "all") return { mode: "all" };
+  if (loop?.mode !== "selection") return { mode: "off" };
+
+  const start = cursorOnTimeline(loop.start, timeline);
+  const end = cursorOnTimeline(loop.end, timeline);
+  const startValue = start && decimalInteger(start.value);
+  const endValue = end && decimalInteger(end.value);
+  if (!start || !end || startValue == null || endValue == null || startValue > endValue) {
+    return { mode: "off" };
+  }
+  return { mode: "selection", start, end };
+}
+
+/** Converts the service playback contract to the snake_case Rust/Wasm context. */
+export function replayPlaybackContext(
+  recording: Recording,
+  session: ReplayPlaybackSource,
+): ReplayPlaybackContext {
+  const timelines = Array.isArray(recording.timelines)
+    ? recording.timelines.filter(validTimeline)
+    : [];
+  const requestedTimeline =
+    typeof session.initialTimeline === "string"
+      ? timelines.find((timeline) => timeline.name === session.initialTimeline)
+      : undefined;
+  const defaultTimeline = timelines.find(
+    (timeline) => timeline.name === recording.defaultTimeline,
+  );
+  const timeline =
+    requestedTimeline ??
+    defaultTimeline ??
+    timelines[0] ?? {
+      name:
+        (typeof session.initialTimeline === "string" && session.initialTimeline.trim()) ||
+        recording.defaultTimeline?.trim() ||
+        "log_time",
+      kind: isTimelineKind(session.initialCursor?.kind) ? session.initialCursor.kind : "sequence",
+      start: "0",
+      end: "0",
+      durationSeconds: null,
+      fps: null,
+    };
+  const cursor =
+    cursorOnTimeline(session.initialCursor, timeline) ??
+    legacyCursor(timeline, session.cursorSeconds);
+  const speed =
+    typeof session.initialSpeed === "number" &&
+    Number.isFinite(session.initialSpeed) &&
+    session.initialSpeed >= 0.01 &&
+    session.initialSpeed <= 64
+      ? session.initialSpeed
+      : 1;
+
+  return {
+    initial_timeline: timeline.name,
+    initial_cursor: cursor,
+    initial_play_state:
+      session.initialPlayState === "playing" ? "playing" : "paused",
+    initial_fps:
+      timeline.kind === "sequence" && timeline.fps != null ? timeline.fps : null,
+    initial_speed: speed,
+    initial_loop: normalizedLoop(session.initialLoop, timeline),
+  };
+}
+
+function hasFreshRequiredTopics(source: DataSource, topics: Topic[]): boolean {
+  if (source.topicIds.length === 0) return false;
+  const topicsById = new Map(topics.map((topic) => [topic.id, topic]));
+  return source.topicIds.every((topicId) => {
+    const topic = topicsById.get(topicId);
+    return (
+      topic?.dataSourceId === source.id &&
+      topic.deviceId === source.deviceId &&
+      topic.quality === "fresh"
+    );
+  });
+}
+
 export function isLiveControlContextEnabled(
   workspace: WorkspaceSnapshot,
   device: Device,
   session: LiveSession,
+  topics: Topic[],
 ): boolean {
+  const workspaceDevice = workspace.devices.find((candidate) => candidate.id === device.id);
+  const source = workspace.dataSources.find(
+    (candidate) =>
+      candidate.id === session.dataSourceId && candidate.deviceId === session.deviceId,
+  );
   const deviceAssignment = workspace.deviceAssignments.find(
     (assignment) =>
+      assignment.projectId === workspace.project.id &&
       assignment.deviceId === device.id &&
       assignment.accessMode === "control" &&
       assignment.validTo == null,
   );
   const dataAssignment = workspace.dataAssignments.find(
     (assignment) =>
+      assignment.projectId === workspace.project.id &&
       assignment.dataSourceId === session.dataSourceId &&
       assignment.visibility === "operator" &&
       assignment.validTo == null,
@@ -270,6 +449,11 @@ export function isLiveControlContextEnabled(
 
   return (
     workspace.project.status === "active" &&
+    workspace.project.id === session.projectId &&
+    workspaceDevice != null &&
+    source != null &&
+    isMatchingLiveSource(source, device.id, session.dataSourceId) &&
+    source.status === "recording" &&
     deviceAssignment != null &&
     dataAssignment != null &&
     device.status === "online" &&
@@ -277,11 +461,42 @@ export function isLiveControlContextEnabled(
     device.health !== "critical" &&
     session.status === "open" &&
     session.playState === "following" &&
-    session.openedBy === OPERATOR_ID
+    session.sourceHealth === "fresh" &&
+    session.openedBy === OPERATOR_ID &&
+    session.streamUrl.trim().length > 0 &&
+    hasFreshRequiredTopics(source, topics)
   );
 }
 
-async function resolveSession(api: RmsApi, route: Extract<RmsRoute, { kind: "live" | "replay" }>): Promise<ResolvedSession> {
+/**
+ * Selects the immutable Topic descriptor snapshot owned by a Recording.
+ *
+ * A DataSource can be reused by later imports, so its current Topics are not a valid Replay
+ * fallback for an older Recording.
+ */
+export function replayTopics(
+  workspace: WorkspaceSnapshot,
+  recording: Recording,
+): Topic[] {
+  const topics = workspace.topicsByRecording?.[recording.id];
+  const expectedTopicIds = new Set(recording.topicIds);
+  const snapshotIsComplete =
+    topics != null &&
+    expectedTopicIds.size === recording.topicIds.length &&
+    topics.length === expectedTopicIds.size &&
+    topics.every(
+      (topic) =>
+        expectedTopicIds.has(topic.id) &&
+        topic.dataSourceId === recording.dataSourceId &&
+        topic.deviceId === recording.deviceId,
+    );
+  if (!snapshotIsComplete) {
+    throw new Error(`Recording Topic snapshot mismatch: ${recording.id}`);
+  }
+  return topics;
+}
+
+export async function resolveSession(api: RmsApi, route: Extract<RmsRoute, { kind: "live" | "replay" }>): Promise<ResolvedSession> {
   const workspace = await api.projects.getWorkspace(route.projectId);
 
   if (route.kind === "live") {
@@ -326,7 +541,7 @@ async function resolveSession(api: RmsApi, route: Extract<RmsRoute, { kind: "liv
       device,
       session,
       topics: workspace.topicsByDataSource[source.id] ?? [],
-      sourceName: source.name,
+      source,
     };
   }
 
@@ -369,10 +584,31 @@ async function resolveSession(api: RmsApi, route: Extract<RmsRoute, { kind: "liv
     device,
     session,
     recording,
-    topics:
-      workspace.topicsByDataSource[recording.dataSourceId] ??
-      (await api.integrations.listTopics(recording.dataSourceId)),
+    topics: replayTopics(workspace, recording),
   };
+}
+
+export function replaceWithCanonicalSessionRoute(
+  route: Extract<RmsRoute, { kind: "live" | "replay" }>,
+  resolved: ResolvedSession,
+): string {
+  const canonicalPath =
+    resolved.kind === "live"
+      ? livePath(
+          route.projectId,
+          resolved.device.id,
+          resolved.session.id,
+          resolved.session.dataSourceId,
+        )
+      : replayPath(
+          route.projectId,
+          resolved.recording.id,
+          resolved.session.id,
+        );
+  if (`${window.location.pathname}${window.location.search}` !== canonicalPath) {
+    window.history.replaceState(null, "", canonicalPath);
+  }
+  return canonicalPath;
 }
 
 function applyResolvedSession(
@@ -391,12 +627,17 @@ function applyResolvedSession(
       device_state_version: resolved.device.stateVersion,
       live_session_id: resolved.session.id,
       data_source_id: resolved.session.dataSourceId,
-      source_name: resolved.sourceName,
+      source_name: resolved.source.name,
       source_url: absoluteSourceUrl(resolved.session.streamUrl),
       operator_id: OPERATOR_ID,
       control_enabled:
         liveControlRequested &&
-        isLiveControlContextEnabled(resolved.workspace, resolved.device, resolved.session),
+        isLiveControlContextEnabled(
+          resolved.workspace,
+          resolved.device,
+          resolved.session,
+          resolved.topics,
+        ),
       topics: topicContexts(resolved.topics),
     });
     return;
@@ -412,6 +653,7 @@ function applyResolvedSession(
     replay_session_id: resolved.session.id,
     source_url: absoluteSourceUrl(resolved.session.streamUrl),
     captured_at_label: compactTimestamp(resolved.recording.capturedAt),
+    ...replayPlaybackContext(resolved.recording, resolved.session),
     topics: topicContexts(resolved.topics),
   });
 }
@@ -491,11 +733,12 @@ async function resolveControlEvent(
       message: receipt.message,
     };
   } catch (cause: unknown) {
+    console.error("RMS control request failed", cause);
     return {
       type: "failed",
       request_id: event.request_id,
       device_id: event.device_id,
-      message: cause instanceof Error ? cause.message : "요청을 처리하지 못했습니다",
+      message: "요청을 처리하지 못했습니다",
     };
   }
 }
@@ -585,7 +828,8 @@ export function ViewerWorkspace({
 
     const fail = (cause: unknown) => {
       if (!lifecycleGate.failClosed()) return;
-      const nextMessage = cause instanceof Error ? cause.message : "화면을 불러오지 못했습니다";
+      console.error("RMS Viewer failed", cause);
+      const nextMessage = VIEWER_FAILURE_MESSAGE;
       if (heartbeatTimer) clearTimeout(heartbeatTimer);
       heartbeatTimer = undefined;
       unsubscribeEvents?.();
@@ -618,7 +862,12 @@ export function ViewerWorkspace({
             const controlAuthorized =
               live != null &&
               lifecycleGate.canProcessLive() &&
-              isLiveControlContextEnabled(live.workspace, live.device, live.session);
+              isLiveControlContextEnabled(
+                live.workspace,
+                live.device,
+                live.session,
+                live.topics,
+              );
             if (!live || (!controlAuthorized && !cleanupRelease)) {
               const message =
                 live
@@ -640,7 +889,12 @@ export function ViewerWorkspace({
               if (
                 event.type !== "release_control_lease" &&
                 (!lifecycleGate.canProcessLive() ||
-                  !isLiveControlContextEnabled(live.workspace, live.device, live.session))
+                  !isLiveControlContextEnabled(
+                    live.workspace,
+                    live.device,
+                    live.session,
+                    live.topics,
+                  ))
               ) {
                 deliverControlResponse({
                   type: "failed",
@@ -787,23 +1041,22 @@ export function ViewerWorkspace({
                   ) {
                     return;
                   }
-                  const device =
-                    workspace.devices.find((candidate) => candidate.id === current.device.id) ??
-                    current.device;
-                  const source = workspace.dataSources.find((candidate) =>
-                    isMatchingLiveSource(
-                      candidate,
-                      device.id,
-                      current.session.dataSourceId,
-                    ),
+                  const currentDevice = workspace.devices.find(
+                    (candidate) => candidate.id === current.device.id,
+                  );
+                  const source = workspace.dataSources.find(
+                    (candidate) =>
+                      candidate.id === current.session.dataSourceId &&
+                      candidate.deviceId === current.device.id,
                   );
                   resolved = {
                     ...current,
                     workspace,
-                    device,
+                    device: currentDevice ?? current.device,
+                    source: source ?? current.source,
                     topics: source
-                      ? workspace.topicsByDataSource[source.id] ?? current.topics
-                      : current.topics,
+                      ? workspace.topicsByDataSource[source.id] ?? []
+                      : [],
                   };
                   applyResolvedSession(handle!, resolved, lifecycleGate.canProcessLive());
                 })
@@ -813,22 +1066,7 @@ export function ViewerWorkspace({
           );
         }
 
-        const canonicalPath =
-          nextResolved.kind === "live"
-            ? livePath(
-                route.projectId,
-                nextResolved.device.id,
-                nextResolved.session.id,
-                nextResolved.session.dataSourceId,
-              )
-            : replayPath(
-                route.projectId,
-                nextResolved.recording.id,
-                nextResolved.session.id,
-              );
-        if (`${window.location.pathname}${window.location.search}` !== canonicalPath) {
-          window.history.replaceState(null, "", canonicalPath);
-        }
+        replaceWithCanonicalSessionRoute(route, nextResolved);
         setStatus("running");
       })
       .catch((cause: unknown) => {

@@ -163,6 +163,23 @@ describe("MockRmsApi integrated service flow", () => {
       projectId: project.id,
       projectName: project.name,
     });
+    expect(recording).toMatchObject({
+      defaultTimeline: "tick",
+      durationSeconds: 50,
+      rrdVersion: "0.36.1",
+      footerVerified: true,
+    });
+    expect(recording.contentSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(recording.timelines).toEqual([
+      {
+        name: "tick",
+        kind: "sequence",
+        start: "0",
+        end: "100",
+        durationSeconds: 50,
+        fps: 2,
+      },
+    ]);
     expect(await api.control.getLease(liveSession.id)).toBeNull();
 
     const replaySession = await api.replay.createSession({
@@ -171,6 +188,14 @@ describe("MockRmsApi integrated service flow", () => {
       openedBy: "operator-01",
     });
     expect(replaySession.streamUrl).toBe(recording.rrdUrl);
+    expect(replaySession).toMatchObject({
+      cursorSeconds: 0,
+      initialTimeline: "tick",
+      initialCursor: { kind: "sequence", value: "0" },
+      initialPlayState: "paused",
+      initialSpeed: 1,
+      initialLoop: { mode: "off" },
+    });
     expect("sendCommand" in api.replay).toBe(false);
     expect("requestLease" in api.replay).toBe(false);
   });
@@ -261,5 +286,112 @@ describe("MockRmsApi integrated service flow", () => {
     await expect(
       api.projects.assignDevice(second.id, { deviceId: device.id, accessMode: "control" }),
     ).rejects.toThrow("동시에 두 프로젝트");
+  });
+
+  it("discovers and verifies without registering anything, then links once as observe", async () => {
+    const api = new MockRmsApi();
+    const projectId = "project-logistics";
+    const beforeIntegrations = await api.integrations.listIntegrations();
+    const beforeDevices = await api.integrations.listDevices();
+    const beforeSources = await api.integrations.listDataSources();
+    const beforeWorkspace = await api.projects.getWorkspace(projectId);
+
+    const session = await api.discovery.start({ organizationId: "organization-rms" });
+    expect(session).toMatchObject({ status: "searching", candidateCount: 0 });
+    const snapshot = await api.discovery.getSnapshot(session.id);
+    expect(snapshot.session.status).toBe("ready");
+    expect(snapshot.candidates.length).toBeGreaterThan(0);
+    const candidateKeys = new Set(snapshot.candidates.flatMap((candidate) => Object.keys(candidate)));
+    expect(candidateKeys).not.toContain("liveUrl");
+    expect(candidateKeys).not.toContain("endpoint");
+    expect(candidateKeys).not.toContain("protocol");
+    expect(candidateKeys).not.toContain("mappingVersion");
+    expect(candidateKeys).not.toContain("ip");
+    expect(candidateKeys).not.toContain("port");
+
+    expect(await api.integrations.listIntegrations()).toHaveLength(beforeIntegrations.length);
+    expect(await api.integrations.listDevices()).toHaveLength(beforeDevices.length);
+    expect(await api.integrations.listDataSources()).toHaveLength(beforeSources.length);
+
+    const candidate = snapshot.candidates[0]!;
+    const verification = await api.discovery.verify(session.id, candidate.id);
+    expect(verification.status).toBe("verified");
+    expect(await api.integrations.listDevices()).toHaveLength(beforeDevices.length);
+
+    const input = {
+      verificationToken: verification.verificationToken,
+      projectId,
+      expectedWorkspaceVersion: beforeWorkspace.snapshotVersion,
+      deviceName: verification.suggestedDevice.name,
+      selectedSourceIds: [verification.sources[0]!.id],
+      accessMode: "observe" as const,
+      visibility: "operator" as const,
+    };
+    const receipt = await api.discovery.approve(session.id, candidate.id, input);
+    const retried = await api.discovery.approve(session.id, candidate.id, input);
+
+    expect(retried).toEqual(receipt);
+    expect(await api.integrations.listIntegrations()).toHaveLength(beforeIntegrations.length + 1);
+    const devices = await api.integrations.listDevices();
+    const sources = await api.integrations.listDataSources(receipt.deviceId);
+    const workspace = await api.projects.getWorkspace(projectId);
+    expect(devices.find((device) => device.id === receipt.deviceId)).toMatchObject({
+      health: "unknown",
+      kind: "robot",
+    });
+    expect(sources).toHaveLength(1);
+    expect(sources[0]).toMatchObject({ status: "pending" });
+    expect(
+      workspace.deviceAssignments.find(
+        (assignment) => assignment.deviceId === receipt.deviceId,
+      ),
+    ).toMatchObject({ accessMode: "observe" });
+    expect(
+      workspace.dataAssignments.find(
+        (assignment) => assignment.dataSourceId === receipt.dataSourceIds[0],
+      ),
+    ).toMatchObject({ visibility: "operator" });
+    expect(await api.control.getLease("not-a-live-session")).toBeNull();
+  });
+
+  it("rejects cancelled, expired, and stale discovery approvals", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-21T00:00:00Z"));
+    try {
+      const api = new MockRmsApi();
+      const cancelled = await api.discovery.start({ organizationId: "organization-rms" });
+      const cancelledSnapshot = await api.discovery.getSnapshot(cancelled.id);
+      await api.discovery.cancel(cancelled.id);
+      await expect(
+        api.discovery.verify(cancelled.id, cancelledSnapshot.candidates[0]!.id),
+      ).rejects.toThrow();
+
+      const session = await api.discovery.start({ organizationId: "organization-rms" });
+      const snapshot = await api.discovery.getSnapshot(session.id);
+      const verification = await api.discovery.verify(session.id, snapshot.candidates[0]!.id);
+      const workspace = await api.projects.getWorkspace("project-logistics");
+      const input = {
+        verificationToken: verification.verificationToken,
+        projectId: "project-logistics",
+        expectedWorkspaceVersion: workspace.snapshotVersion + 1,
+        deviceName: "Robot-Stale",
+        selectedSourceIds: [verification.sources[0]!.id],
+        accessMode: "observe" as const,
+        visibility: "operator" as const,
+      };
+      await expect(
+        api.discovery.approve(session.id, snapshot.candidates[0]!.id, input),
+      ).rejects.toThrow("변경");
+
+      await vi.advanceTimersByTimeAsync(121_000);
+      await expect(
+        api.discovery.approve(session.id, snapshot.candidates[0]!.id, {
+          ...input,
+          expectedWorkspaceVersion: workspace.snapshotVersion,
+        }),
+      ).rejects.toThrow("지났습니다");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

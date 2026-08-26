@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse as _, Response, Sse, sse::Event},
     routing::{get, post},
 };
@@ -15,15 +15,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     AppState,
     domain::{
-        CreateLiveSessionRequest, CreateReplaySessionRequest, LiveSession, Recording,
-        RecordingProjectSnapshot, ReplaySession,
+        CreateLiveSessionRequest, CreateReplaySessionRequest, LiveSession, PlaybackCursor,
+        Recording, RecordingProjectSnapshot, ReplaySession,
     },
     error::{ApiError, ApiResult},
+    rrd_fixture,
     state::{new_id, now_iso},
 };
-
-const RRD_FIXTURE: &[u8] =
-    include_bytes!("../../../../../tests/assets/rrd/snippets/views/spatial3d.rrd");
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -47,6 +45,8 @@ pub(super) fn router() -> Router<AppState> {
             "/rerun/recordings/{recording_id}",
             get(open_recording_stream),
         )
+        .route("/rerun/fixture/rms-replay.rrd", get(open_fixture_stream))
+        // Kept so older locally-created source fixtures continue to open offline.
         .route("/rerun/fixture/spatial3d.rrd", get(open_fixture_stream))
 }
 
@@ -88,9 +88,9 @@ async fn create_live_session(
             "An offline Device cannot start a LiveSession.",
         ));
     }
-    if matches!(source.status.as_str(), "offline" | "degraded") {
+    if source.status != "recording" {
         return Err(ApiError::conflict(
-            "DataSource is not available for a LiveSession.",
+            "Only a recording DataSource can start a LiveSession.",
         ));
     }
     let device_is_assigned = catalog.device_assignments.values().any(|assignment| {
@@ -157,89 +157,108 @@ async fn close_live_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Recording>> {
-    let mut catalog = state.catalog.write().await;
-    let session = catalog
-        .live_sessions
-        .get(&session_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("LiveSession", &session_id))?;
-    if session.status != "open" {
-        return Err(ApiError::conflict("LiveSession is already closed."));
-    }
-    let project = catalog
-        .projects
-        .get(&session.project_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("Project", &session.project_id))?;
-    let source = catalog
-        .data_sources
-        .get(&session.data_source_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("DataSource", &session.data_source_id))?;
-    let device_assignment = catalog
-        .device_assignments
-        .values()
-        .find(|assignment| {
-            assignment.project_id == session.project_id
-                && assignment.device_id == session.device_id
-                && assignment.valid_to.is_none()
-        })
-        .cloned()
-        .ok_or_else(|| ApiError::conflict("Active DeviceAssignment is required."))?;
-    let data_assignment = catalog
-        .data_assignments
-        .values()
-        .find(|assignment| {
-            assignment.project_id == session.project_id
-                && assignment.data_source_id == session.data_source_id
-                && assignment.valid_to.is_none()
-        })
-        .cloned()
-        .ok_or_else(|| ApiError::conflict("Active DataAssignment is required."))?;
+    let (recording, shutdown) = state
+        .durable_catalog_mutation(move |catalog| {
+            let session = catalog
+                .live_sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("LiveSession", &session_id))?;
+            if session.status != "open" {
+                return Err(ApiError::conflict("LiveSession is already closed."));
+            }
+            let project = catalog
+                .projects
+                .get(&session.project_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("Project", &session.project_id))?;
+            let source = catalog
+                .data_sources
+                .get(&session.data_source_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("DataSource", &session.data_source_id))?;
+            let recording_topics = catalog
+                .topics_by_data_source
+                .get(&source.id)
+                .cloned()
+                .unwrap_or_default();
+            let device_assignment = catalog
+                .device_assignments
+                .values()
+                .find(|assignment| {
+                    assignment.project_id == session.project_id
+                        && assignment.device_id == session.device_id
+                        && assignment.valid_to.is_none()
+                })
+                .cloned()
+                .ok_or_else(|| ApiError::conflict("Active DeviceAssignment is required."))?;
+            let data_assignment = catalog
+                .data_assignments
+                .values()
+                .find(|assignment| {
+                    assignment.project_id == session.project_id
+                        && assignment.data_source_id == session.data_source_id
+                        && assignment.valid_to.is_none()
+                })
+                .cloned()
+                .ok_or_else(|| ApiError::conflict("Active DataAssignment is required."))?;
 
-    let closed_at = now_iso();
-    let resource_version = catalog.bump_version();
-    let mut closed_session = session.clone();
-    closed_session.status = "closed".to_owned();
-    closed_session.closed_at = Some(closed_at.clone());
-    closed_session.resource_version = resource_version;
-    catalog
-        .live_sessions
-        .insert(session.id.clone(), closed_session);
-    catalog
-        .leases
-        .retain(|_, lease| lease.live_session_id != session.id);
-    if let Some(shutdown) = catalog.live_session_shutdown.remove(&session.id) {
+            let closed_at = now_iso();
+            let resource_version = catalog.bump_version();
+            let mut closed_session = session.clone();
+            closed_session.status = "closed".to_owned();
+            closed_session.closed_at = Some(closed_at.clone());
+            closed_session.resource_version = resource_version;
+            catalog
+                .live_sessions
+                .insert(session.id.clone(), closed_session);
+            catalog
+                .leases
+                .retain(|_, lease| lease.live_session_id != session.id);
+            let shutdown = catalog.live_session_shutdown.remove(&session.id);
+
+            let recording_id = new_id("recording");
+            let recording = Recording {
+                id: recording_id.clone(),
+                organization_id: project.organization_id,
+                project_id: project.id.clone(),
+                device_id: session.device_id,
+                data_source_id: source.id.clone(),
+                name: format!("{} 운용 기록", project.name),
+                status: "ready".to_owned(),
+                rrd_url: format!("/rerun/recordings/{recording_id}"),
+                captured_at: session.started_at,
+                duration_label: rrd_fixture::DURATION_LABEL.to_owned(),
+                timelines: rrd_fixture::timelines(),
+                default_timeline: rrd_fixture::DEFAULT_TIMELINE.to_owned(),
+                duration_seconds: rrd_fixture::DURATION_SECONDS,
+                rrd_version: rrd_fixture::RRD_VERSION.to_owned(),
+                footer_verified: true,
+                content_sha256: rrd_fixture::content_sha256().to_owned(),
+                topic_ids: source.topic_ids,
+                mapping_version: source.mapping_version,
+                project_snapshot: RecordingProjectSnapshot {
+                    project_id: project.id,
+                    project_name: project.name,
+                    captured_at: closed_at,
+                    device_assignment_id: device_assignment.id,
+                    data_assignment_id: data_assignment.id,
+                },
+                resource_version,
+                manifest_hash: format!("sha256:{}", rrd_fixture::content_sha256()),
+            };
+            catalog
+                .topics_by_recording
+                .insert(recording.id.clone(), recording_topics);
+            catalog
+                .recordings
+                .insert(recording.id.clone(), recording.clone());
+            Ok((recording, shutdown))
+        })
+        .await?;
+    if let Some(shutdown) = shutdown {
         shutdown.send_replace(true);
     }
-
-    let recording_id = new_id("recording");
-    let recording = Recording {
-        id: recording_id.clone(),
-        organization_id: project.organization_id,
-        project_id: project.id.clone(),
-        device_id: session.device_id,
-        data_source_id: source.id.clone(),
-        name: format!("{} 운용 기록", project.name),
-        status: "ready".to_owned(),
-        rrd_url: format!("/rerun/recordings/{recording_id}"),
-        captured_at: session.started_at,
-        duration_label: "방금 종료".to_owned(),
-        topic_ids: source.topic_ids,
-        mapping_version: source.mapping_version,
-        project_snapshot: RecordingProjectSnapshot {
-            project_id: project.id,
-            project_name: project.name,
-            captured_at: closed_at,
-            device_assignment_id: device_assignment.id,
-            data_assignment_id: data_assignment.id,
-        },
-        resource_version,
-        manifest_hash: format!("sha256:{recording_id}-immutable-local-fixture"),
-    };
-    catalog
-        .recordings
-        .insert(recording.id.clone(), recording.clone());
     Ok(Json(recording))
 }
 
@@ -270,6 +289,27 @@ async fn create_replay_session(
         ));
     }
 
+    let initial_timeline = recording.default_timeline.clone();
+    let timeline = recording
+        .timelines
+        .iter()
+        .find(|timeline| timeline.name == initial_timeline)
+        .ok_or_else(|| {
+            ApiError::conflict("Recording defaultTimeline does not have timeline metadata.")
+        })?;
+    if !matches!(
+        timeline.kind.as_str(),
+        "sequence" | "timestamp" | "duration"
+    ) {
+        return Err(ApiError::conflict(
+            "Recording timeline kind is not supported for Replay.",
+        ));
+    }
+    let initial_cursor = PlaybackCursor {
+        kind: timeline.kind.clone(),
+        value: timeline.start.clone(),
+    };
+
     let resource_version = catalog.bump_version();
     let session_id = new_id("replay-session");
     let session = ReplaySession {
@@ -281,6 +321,14 @@ async fn create_replay_session(
         status: "open".to_owned(),
         stream_url: format!("/rerun/replay/{session_id}"),
         cursor_seconds: 0.0,
+        initial_timeline,
+        initial_cursor,
+        // Imported recordings often start with metadata or raw transport messages before the
+        // first drawable camera/spatial sample. Starting playback lets the first real sample
+        // become visible without leaving operators on an apparently broken empty frame.
+        initial_play_state: "playing".to_owned(),
+        initial_speed: 1.0,
+        initial_loop: rrd_fixture::initial_loop(),
         opened_at: now_iso(),
         closed_at: None,
         resource_version,
@@ -327,6 +375,7 @@ async fn close_replay_session(
 async fn open_live_stream(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let catalog = state.catalog.read().await;
     let session = catalog
@@ -336,12 +385,13 @@ async fn open_live_stream(
     if session.status != "open" {
         return Err(ApiError::conflict("LiveSession is closed."));
     }
-    Ok(rrd_response())
+    Ok(rrd_response(&headers, RrdCachePolicy::Live))
 }
 
 async fn open_replay_stream(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let catalog = state.catalog.read().await;
     let session = catalog
@@ -351,12 +401,36 @@ async fn open_replay_stream(
     if session.status != "open" {
         return Err(ApiError::conflict("ReplaySession is closed."));
     }
-    Ok(rrd_response())
+    let recording = catalog
+        .recordings
+        .get(&session.recording_id)
+        .ok_or_else(|| ApiError::not_found("Recording", &session.recording_id))?;
+    let stored_artifact = catalog
+        .recording_artifacts
+        .get(&recording.id)
+        .map(|path| (path.clone(), recording.content_sha256.clone()));
+    drop(catalog);
+
+    if let Some((relative_path, content_sha256)) = stored_artifact {
+        return state
+            .import_storage
+            .file_response(
+                &relative_path,
+                &headers,
+                "application/x-rerun",
+                &content_sha256,
+                true,
+            )
+            .await
+            .map_err(|_io| ApiError::internal("Recording artifact could not be read."));
+    }
+    Ok(rrd_response(&headers, RrdCachePolicy::Immutable))
 }
 
 async fn open_recording_stream(
     State(state): State<AppState>,
     Path(recording_id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let catalog = state.catalog.read().await;
     let recording = catalog
@@ -366,27 +440,132 @@ async fn open_recording_stream(
     if recording.status != "ready" {
         return Err(ApiError::conflict("Recording is not ready."));
     }
-    Ok(rrd_response())
+    let stored_artifact = catalog
+        .recording_artifacts
+        .get(&recording_id)
+        .map(|path| (path.clone(), recording.content_sha256.clone()));
+    drop(catalog);
+
+    if let Some((relative_path, content_sha256)) = stored_artifact {
+        return state
+            .import_storage
+            .file_response(
+                &relative_path,
+                &headers,
+                "application/x-rerun",
+                &content_sha256,
+                true,
+            )
+            .await
+            .map_err(|_io| ApiError::internal("Recording artifact could not be read."));
+    }
+    Ok(rrd_response(&headers, RrdCachePolicy::Immutable))
 }
 
-fn rrd_response() -> Response {
-    let mut response = Body::from(RRD_FIXTURE).into_response();
+#[derive(Clone, Copy)]
+enum RrdCachePolicy {
+    Live,
+    Immutable,
+}
+
+fn rrd_response(request_headers: &HeaderMap, cache_policy: RrdCachePolicy) -> Response {
+    let total_len = rrd_fixture::BYTES.len();
+    let range = request_headers.get(header::RANGE).and_then(|value| {
+        let if_range_matches = request_headers
+            .get(header::IF_RANGE)
+            .is_none_or(|if_range| if_range.as_bytes() == rrd_fixture::etag().as_bytes());
+        if if_range_matches {
+            value
+                .to_str()
+                .ok()
+                .map(|value| parse_range(value, total_len))
+        } else {
+            None
+        }
+    });
+
+    let (mut response, response_len) = match range {
+        Some(Ok((start, end))) => {
+            let mut response = Body::from(rrd_fixture::BYTES[start..=end].to_vec()).into_response();
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{total_len}"))
+                    .expect("valid Content-Range"),
+            );
+            (response, end - start + 1)
+        }
+        Some(Err(())) => {
+            let mut response = Body::empty().into_response();
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total_len}"))
+                    .expect("valid Content-Range"),
+            );
+            (response, 0)
+        }
+        None => (Body::from(rrd_fixture::BYTES).into_response(), total_len),
+    };
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
+        HeaderValue::from_static("application/x-rerun"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        match cache_policy {
+            RrdCachePolicy::Live => HeaderValue::from_static("no-store"),
+            RrdCachePolicy::Immutable => {
+                HeaderValue::from_static("public, max-age=31536000, immutable")
+            }
+        },
     );
     response
         .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
+        header::ETAG,
+        HeaderValue::from_str(rrd_fixture::etag()).expect("valid RRD fixture ETag"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&response_len.to_string()).expect("valid RRD content length"),
     );
     response
 }
 
-async fn open_fixture_stream() -> Response {
-    rrd_response()
+fn parse_range(value: &str, total_len: usize) -> Result<(usize, usize), ()> {
+    let range = value.strip_prefix("bytes=").ok_or(())?;
+    if total_len == 0 || range.contains(',') {
+        return Err(());
+    }
+    let (start, end) = range.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix_len = end.parse::<usize>().ok().ok_or(())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = total_len.saturating_sub(suffix_len);
+        return Ok((start, total_len - 1));
+    }
+
+    let start = start.parse::<usize>().ok().ok_or(())?;
+    if start >= total_len {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        total_len - 1
+    } else {
+        end.parse::<usize>().ok().ok_or(())?.min(total_len - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok((start, end))
+}
+
+async fn open_fixture_stream(headers: HeaderMap) -> Response {
+    rrd_response(&headers, RrdCachePolicy::Immutable)
 }
 
 async fn live_events(

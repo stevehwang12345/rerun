@@ -146,6 +146,31 @@ impl McapImporter {
     where
         BytesSource: AsRef<[u8]>,
     {
+        self.emit_chunks_with_cancellation(
+            mcap_file,
+            timeline_type,
+            timestamp_offset_ns,
+            &|| false,
+            emit_chunk,
+        )
+    }
+
+    /// Load chunks from an [`re_mcap::McapFile`], stopping promptly when requested.
+    ///
+    /// The cancellation predicate is checked between indexed chunks, while iterating messages,
+    /// and before expensive lens processing and emission. [`Self::emit_chunks`] remains the
+    /// compatibility API for callers that do not need cancellation.
+    pub fn emit_chunks_with_cancellation<BytesSource>(
+        &self,
+        mcap_file: &re_mcap::McapFile<BytesSource>,
+        timeline_type: re_log_types::TimeType,
+        timestamp_offset_ns: Option<i64>,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+        emit_chunk: &(dyn Fn(re_chunk::Chunk) + Send + Sync),
+    ) -> Result<(), ImporterError>
+    where
+        BytesSource: AsRef<[u8]>,
+    {
         // Tag the scope with the time range so each window of a windowed read is a distinct span.
         re_tracing::profile_function!(match self.time_range {
             Some((start, end)) => format!("log_time [{start}, {end})"),
@@ -156,6 +181,9 @@ impl McapImporter {
 
         // Apply time offset (if set) and make sure chunks are sorted by RowId before passing to the callback.
         let emit_final_chunk = |chunk: re_chunk::Chunk| {
+            if is_cancelled() {
+                return;
+            }
             let mut chunk = apply_timestamp_offset(chunk, timestamp_offset_ns);
             chunk.sort_by_row_ids_if_needed();
 
@@ -167,8 +195,14 @@ impl McapImporter {
         };
 
         let on_chunk_with_transforms = |chunk: re_chunk::Chunk| {
+            if is_cancelled() {
+                return;
+            }
             if let Some(ref lenses) = lenses {
                 for result in lenses.apply(&chunk, &re_lenses::default_runtime()) {
+                    if is_cancelled() {
+                        return;
+                    }
                     match result {
                         Ok(chunk) => emit_final_chunk(chunk),
                         Err(partial) => {
@@ -191,13 +225,17 @@ impl McapImporter {
             .select(&self.selected_decoders)
             .plan(mcap_file.bytes(), &summary, &self.topic_filter)?
             .with_time_range(self.time_range)
-            .run(
+            .run_with_cancellation(
                 mcap_file.bytes(),
                 &summary,
                 timeline_type,
+                is_cancelled,
                 &on_chunk_with_transforms,
             )?;
 
+        if is_cancelled() {
+            return Err(anyhow::Error::from(re_mcap::Error::Cancelled).into());
+        }
         if self
             .selected_decoders
             .contains(&DecoderIdentifier::from(URDF_DECODER_IDENTIFIER))
@@ -210,6 +248,10 @@ impl McapImporter {
             )
         {
             re_log::warn_once!("Failed to extract URDF from robot_description topics: {err}");
+        }
+
+        if is_cancelled() {
+            return Err(anyhow::Error::from(re_mcap::Error::Cancelled).into());
         }
 
         Ok(())
