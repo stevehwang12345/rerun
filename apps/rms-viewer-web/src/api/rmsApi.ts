@@ -1,4 +1,6 @@
 import type {
+  ApproveNetworkCandidateInput,
+  CandidateVerification,
   CommandReceipt,
   ControlLease,
   DataAssignment,
@@ -8,8 +10,13 @@ import type {
   Integration,
   LiveControlCommandRequest,
   LiveSession,
+  NetworkDiscoverySession,
+  NetworkDiscoverySnapshot,
+  NetworkLinkReceipt,
   Project,
   Recording,
+  RecordingImport,
+  RecordingImportFormat,
   ReplaySession,
   RmsEvent,
   Topic,
@@ -39,6 +46,30 @@ export type CreateReplaySessionInput = Pick<
   ReplaySession,
   "projectId" | "recordingId" | "openedBy"
 >;
+export interface CreateRecordingImportInput {
+  projectId: string;
+  deviceId: string;
+  dataSourceId?: string;
+  file: File;
+  format: RecordingImportFormat;
+  mapping?: Record<string, unknown>;
+}
+
+export interface RecordingImportRequestOptions {
+  signal?: AbortSignal;
+}
+
+export interface RecordingImportUploadOptions extends RecordingImportRequestOptions {
+  onProgress?: (progressPercent: number) => void;
+}
+
+export interface StartNetworkDiscoveryInput {
+  organizationId: string;
+}
+
+export interface DiscoveryRequestOptions {
+  signal?: AbortSignal;
+}
 
 export interface IntegrationApi {
   listIntegrations(): Promise<Integration[]>;
@@ -78,8 +109,46 @@ export interface LiveApi {
 export interface ReplayApi {
   listRecordings(projectId: string): Promise<Recording[]>;
   createSession(input: CreateReplaySessionInput): Promise<ReplaySession>;
-  getSession(sessionId: string): Promise<ReplaySession>;
+  /** Returns `undefined` only when an ephemeral ReplaySession no longer exists. */
+  getSession(sessionId: string): Promise<ReplaySession | undefined>;
   closeSession(sessionId: string): Promise<void>;
+}
+
+export interface RecordingImportApi {
+  listImports(projectId?: string): Promise<RecordingImport[]>;
+  createImport(
+    input: CreateRecordingImportInput,
+    options?: RecordingImportUploadOptions,
+  ): Promise<RecordingImport>;
+  getImport(
+    importId: string,
+    options?: RecordingImportRequestOptions,
+  ): Promise<RecordingImport>;
+  cancelImport(importId: string): Promise<void>;
+}
+
+/** Discovery is user initiated and only returns sanitized, short-lived candidates. */
+export interface DiscoveryApi {
+  start(
+    input: StartNetworkDiscoveryInput,
+    options?: DiscoveryRequestOptions,
+  ): Promise<NetworkDiscoverySession>;
+  getSnapshot(
+    sessionId: string,
+    options?: DiscoveryRequestOptions,
+  ): Promise<NetworkDiscoverySnapshot>;
+  cancel(sessionId: string): Promise<void>;
+  verify(
+    sessionId: string,
+    candidateId: string,
+    options?: DiscoveryRequestOptions,
+  ): Promise<CandidateVerification>;
+  approve(
+    sessionId: string,
+    candidateId: string,
+    input: ApproveNetworkCandidateInput,
+    options?: DiscoveryRequestOptions,
+  ): Promise<NetworkLinkReceipt>;
 }
 
 export interface ControlApi {
@@ -94,6 +163,8 @@ export interface RmsApi {
   readonly projects: ProjectApi;
   readonly live: LiveApi;
   readonly replay: ReplayApi;
+  readonly recordingImports: RecordingImportApi;
+  readonly discovery: DiscoveryApi;
   readonly control: ControlApi;
 }
 
@@ -126,6 +197,15 @@ class HttpClient {
         ...init,
       }),
     );
+  }
+
+  async optionalJson<T>(path: string, init?: RequestInit): Promise<T | undefined> {
+    const response = await fetch(this.url(path), {
+      credentials: "include",
+      ...init,
+    });
+    if (response.status === 404) return undefined;
+    return parseJson(response);
   }
 
   eventSource(path: string): EventSource {
@@ -317,8 +397,8 @@ class HttpReplayApi implements ReplayApi {
     });
   }
 
-  getSession(sessionId: string): Promise<ReplaySession> {
-    return this.client.json(`/v1/replay-sessions/${encodeURIComponent(sessionId)}`);
+  getSession(sessionId: string): Promise<ReplaySession | undefined> {
+    return this.client.optionalJson(`/v1/replay-sessions/${encodeURIComponent(sessionId)}`);
   }
 
   async closeSession(sessionId: string): Promise<void> {
@@ -331,8 +411,187 @@ class HttpReplayApi implements ReplayApi {
       },
     );
     if (!response.ok) {
-      throw new Error((await response.text()) || "Replay 세션을 종료하지 못했습니다.");
+      console.error("Failed to close Replay session", response.status, await response.text());
+      throw new Error("Replay 세션을 종료하지 못했습니다");
     }
+  }
+}
+
+function uploadAbortError(): DOMException {
+  return new DOMException("Recording import upload aborted", "AbortError");
+}
+
+class HttpRecordingImportApi implements RecordingImportApi {
+  constructor(private readonly client: HttpClient) {}
+
+  listImports(projectId?: string): Promise<RecordingImport[]> {
+    const query = projectId ? `?${new URLSearchParams({ projectId })}` : "";
+    return this.client.json(`/v1/recording-imports${query}`);
+  }
+
+  createImport(
+    input: CreateRecordingImportInput,
+    options: RecordingImportUploadOptions = {},
+  ): Promise<RecordingImport> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      // The import service validates ownership and reserves capacity before it accepts file bytes.
+      // Keep metadata ahead of the streaming file part so invalid targets fail without disk I/O.
+      form.append("projectId", input.projectId);
+      form.append("deviceId", input.deviceId);
+      if (input.dataSourceId) form.append("dataSourceId", input.dataSourceId);
+      form.append("format", input.format);
+      if (input.mapping) form.append("mapping", JSON.stringify(input.mapping));
+      form.append("file", input.file, input.file.name);
+
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        options.signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => {
+        xhr.abort();
+        finish(() => reject(uploadAbortError()));
+      };
+
+      xhr.open("POST", this.client.url("/v1/recording-imports"));
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("Idempotency-Key", crypto.randomUUID());
+      xhr.setRequestHeader("X-RMS-Request-ID", crypto.randomUUID());
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable || event.total <= 0) return;
+        options.onProgress?.(
+          Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))),
+        );
+      };
+      xhr.onload = () => {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          console.error("Recording import upload failed", xhr.status, xhr.responseText);
+          finish(() => reject(new Error("파일을 가져오지 못했습니다")));
+          return;
+        }
+        try {
+          const recordingImport = JSON.parse(xhr.responseText) as RecordingImport;
+          finish(() => resolve(recordingImport));
+        } catch (cause: unknown) {
+          console.error("Invalid recording import response", cause);
+          finish(() => reject(new Error("파일을 가져오지 못했습니다")));
+        }
+      };
+      xhr.onerror = () => {
+        console.error("Recording import upload network failure");
+        finish(() => reject(new Error("파일을 가져오지 못했습니다")));
+      };
+      xhr.onabort = () => finish(() => reject(uploadAbortError()));
+
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      options.onProgress?.(0);
+      xhr.send(form);
+    });
+  }
+
+  getImport(
+    importId: string,
+    options: RecordingImportRequestOptions = {},
+  ): Promise<RecordingImport> {
+    return this.client.json(`/v1/recording-imports/${encodeURIComponent(importId)}`, {
+      signal: options.signal,
+    });
+  }
+
+  async cancelImport(importId: string): Promise<void> {
+    const response = await fetch(
+      this.client.url(`/v1/recording-imports/${encodeURIComponent(importId)}`),
+      {
+        method: "DELETE",
+        credentials: "include",
+        headers: mutationHeaders(),
+      },
+    );
+    if (!response.ok) {
+      console.error("Failed to cancel recording import", response.status, await response.text());
+      throw new Error("가져오기를 취소하지 못했습니다");
+    }
+  }
+}
+
+class HttpDiscoveryApi implements DiscoveryApi {
+  constructor(private readonly client: HttpClient) {}
+
+  start(
+    input: StartNetworkDiscoveryInput,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkDiscoverySession> {
+    return this.client.json("/v1/network-discovery-sessions", {
+      method: "POST",
+      headers: mutationHeaders(),
+      body: JSON.stringify(input),
+      signal: options.signal,
+    });
+  }
+
+  getSnapshot(
+    sessionId: string,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkDiscoverySnapshot> {
+    return this.client.json(
+      `/v1/network-discovery-sessions/${encodeURIComponent(sessionId)}`,
+      { signal: options.signal },
+    );
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    const response = await fetch(
+      this.client.url(`/v1/network-discovery-sessions/${encodeURIComponent(sessionId)}`),
+      {
+        method: "DELETE",
+        credentials: "include",
+        headers: mutationHeaders(),
+      },
+    );
+    if (!response.ok) {
+      console.error("Failed to cancel network discovery", response.status, await response.text());
+      throw new Error("네트워크 검색을 취소하지 못했습니다");
+    }
+  }
+
+  verify(
+    sessionId: string,
+    candidateId: string,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<CandidateVerification> {
+    return this.client.json(
+      `/v1/network-discovery-sessions/${encodeURIComponent(sessionId)}/candidates/${encodeURIComponent(candidateId)}/verification`,
+      {
+        method: "POST",
+        headers: mutationHeaders(),
+        signal: options.signal,
+      },
+    );
+  }
+
+  approve(
+    sessionId: string,
+    candidateId: string,
+    input: ApproveNetworkCandidateInput,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkLinkReceipt> {
+    return this.client.json(
+      `/v1/network-discovery-sessions/${encodeURIComponent(sessionId)}/candidates/${encodeURIComponent(candidateId)}/approval`,
+      {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify(input),
+        signal: options.signal,
+      },
+    );
   }
 }
 
@@ -373,7 +632,8 @@ class HttpControlApi implements ControlApi {
       },
     );
     if (!response.ok) {
-      throw new Error((await response.text()) || "제어권을 반납하지 못했습니다.");
+      console.error("Failed to release control lease", response.status, await response.text());
+      throw new Error("제어권을 반납하지 못했습니다");
     }
   }
 
@@ -394,6 +654,8 @@ export class HttpRmsApi implements RmsApi {
   readonly projects: ProjectApi;
   readonly live: LiveApi;
   readonly replay: ReplayApi;
+  readonly recordingImports: RecordingImportApi;
+  readonly discovery: DiscoveryApi;
   readonly control: ControlApi;
 
   constructor(baseUrl: string) {
@@ -402,6 +664,8 @@ export class HttpRmsApi implements RmsApi {
     this.projects = new HttpProjectApi(client);
     this.live = new HttpLiveApi(client);
     this.replay = new HttpReplayApi(client);
+    this.recordingImports = new HttpRecordingImportApi(client);
+    this.discovery = new HttpDiscoveryApi(client);
     this.control = new HttpControlApi(client);
   }
 }

@@ -389,14 +389,21 @@ impl MessageDecoderRunner {
         summary: &mcap::Summary,
         time_type: TimeType,
         time_range: Option<(u64, u64)>,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
         emit: &(dyn Fn(Chunk) + Send + Sync),
     ) -> Result<(), Error> {
+        if is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         self.inner.init(summary)?;
 
         let allowed = &self.allowed;
         let inner = &*self.inner;
 
         let decode_chunk = |chunk: &::mcap::records::ChunkIndex| -> Result<Vec<Chunk>, Error> {
+            if is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             // Absent or partial in a recovered file, hence the fallible read is not propagated.
             let capacity_hints = summary
                 .read_message_indexes(mcap_bytes, chunk)
@@ -413,6 +420,9 @@ impl MessageDecoderRunner {
             let mut decoder = McapChunkDecoder::new(inner, allowed, capacity_hints, time_type);
 
             for msg in summary.stream_chunk(mcap_bytes, chunk)? {
+                if is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 match msg {
                     Ok(message) => {
                         // Skip messages outside the `[start, end)` `log_time` range.
@@ -436,6 +446,9 @@ impl MessageDecoderRunner {
 
             let mut batch = Vec::new();
             for mut chunk in decoder.finish() {
+                if is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 if let Ok(chunk) = &mut chunk {
                     chunk.sort_by_row_ids_if_needed();
 
@@ -473,7 +486,13 @@ impl MessageDecoderRunner {
         if workers <= 2 {
             // Serial path. Used on wasm32 and on small worker counts.
             for chunk in selected.iter().copied() {
+                if is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 for c in decode_chunk(chunk)? {
+                    if is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
                     emit(c);
                 }
             }
@@ -508,12 +527,18 @@ impl MessageDecoderRunner {
                                 let decode_chunk = &decode_chunk;
                                 scope.spawn(move || -> Result<(), Error> {
                                     loop {
+                                        if is_cancelled() {
+                                            return Err(Error::Cancelled);
+                                        }
                                         let idx = next_idx
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if idx >= total {
                                             return Ok(());
                                         }
                                         let batch = decode_chunk(chunk_indexes[idx])?;
+                                        if is_cancelled() {
+                                            return Err(Error::Cancelled);
+                                        }
                                         // Blocks once `max_in_flight` batches are queued.
                                         re_quota_channel::send_crossbeam(&batch_tx, (idx, batch))
                                             .map_err(|err| {
@@ -544,6 +569,9 @@ impl MessageDecoderRunner {
                     // increasing in emission order. Workers generate `RowId`s from
                     // thread-local counters that are not comparable across threads.
                     let emit_with_new_row_ids = |chunk: Chunk| {
+                        if is_cancelled() {
+                            return;
+                        }
                         let chunk = chunk.clone_as(chunk.id(), RowId::new());
                         emit(chunk);
                     };
@@ -567,7 +595,10 @@ impl MessageDecoderRunner {
                         }
                     }
 
-                    re_log::debug_assert!(buffer.is_empty(), "All batches should've been consumed");
+                    re_log::debug_assert!(
+                        is_cancelled() || buffer.is_empty(),
+                        "All batches should've been consumed"
+                    );
                 },
             );
 
@@ -613,17 +644,44 @@ impl ExecutionPlan {
     }
 
     pub fn run(
-        mut self,
+        self,
         mcap_bytes: &[u8],
         summary: &mcap::Summary,
         time_type: TimeType,
         emit: &(dyn Fn(Chunk) + Send + Sync),
     ) -> anyhow::Result<()> {
+        self.run_with_cancellation(mcap_bytes, summary, time_type, &|| false, emit)
+    }
+
+    /// Runs this plan while periodically checking whether decoding should stop.
+    ///
+    /// Cancellation is checked before file decoders, between indexed chunks, while reading
+    /// messages, and before emitting decoded chunks. Existing callers that do not need
+    /// cancellation should use [`Self::run`].
+    pub fn run_with_cancellation(
+        mut self,
+        mcap_bytes: &[u8],
+        summary: &mcap::Summary,
+        time_type: TimeType,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+        emit: &(dyn Fn(Chunk) + Send + Sync),
+    ) -> anyhow::Result<()> {
+        if is_cancelled() {
+            return Err(Error::Cancelled.into());
+        }
         let empty_channels = collect_empty_channels(mcap_bytes, summary)?;
         let ctx = DecoderContext::new(mcap_bytes, summary, &self.topic_filter, empty_channels);
 
         for mut decoder in self.file_decoders {
-            decoder.process(&ctx, emit)?;
+            if is_cancelled() {
+                return Err(Error::Cancelled.into());
+            }
+            let emit_unless_cancelled = |chunk| {
+                if !is_cancelled() {
+                    emit(chunk);
+                }
+            };
+            decoder.process(&ctx, &emit_unless_cancelled)?;
         }
 
         let time_range = self.time_range;
@@ -633,7 +691,17 @@ impl ExecutionPlan {
             );
         }
         for runner in &mut self.runners {
-            runner.process(mcap_bytes, summary, time_type, time_range, emit)?;
+            runner.process(
+                mcap_bytes,
+                summary,
+                time_type,
+                time_range,
+                is_cancelled,
+                emit,
+            )?;
+        }
+        if is_cancelled() {
+            return Err(Error::Cancelled.into());
         }
         Ok(())
     }
@@ -905,6 +973,7 @@ impl DecoderRegistry {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use re_log_types::TimeType;
     use re_sdk_types::archetypes::McapMessage;
@@ -1105,6 +1174,40 @@ mod tests {
         assert_eq!(serial, expected);
         assert_eq!(parallel, expected);
         assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn cancellation_stops_before_following_indexed_chunks() {
+        let (summary, buffer) = raw_summary_with_log_times(&[10, 20, 30], true);
+        assert_eq!(summary.chunk_indexes.len(), 3);
+
+        let cancelled = AtomicBool::new(false);
+        let emitted = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("failed to build serial test pool");
+        let result = pool.install(|| {
+            DecoderRegistry::empty()
+                .register_message_decoder::<McapRawDecoder>()
+                .plan(&buffer, &summary, &TopicFilter::default())
+                .expect("failed to plan")
+                .run_with_cancellation(
+                    &buffer,
+                    &summary,
+                    TimeType::TimestampNs,
+                    &|| cancelled.load(Ordering::Relaxed),
+                    &|_chunk| {
+                        if emitted.fetch_add(1, Ordering::Relaxed) == 0 {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
+                    },
+                )
+        });
+
+        let error = result.expect_err("cancellation must interrupt indexed chunk decoding");
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
     }
 
     #[test]

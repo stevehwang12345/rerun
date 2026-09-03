@@ -10,7 +10,8 @@ mod product_app;
 mod web;
 
 pub use product_app::{
-    LiveViewerContext, ReplayViewerContext, RmsControlEvent, RmsControlEventSink,
+    LiveViewerContext, ReplayInitialLoop, ReplayInitialLoopMode, ReplayInitialPlayState,
+    ReplayTimeKind, ReplayTimeValue, ReplayViewerContext, RmsControlEvent, RmsControlEventSink,
     RmsControlResponse, RmsHostEvent, RmsHostEventSink, RmsProductApp, RmsSourceKind,
     RmsTopicContext, RmsViewerContext,
 };

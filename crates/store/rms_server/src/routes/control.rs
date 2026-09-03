@@ -43,6 +43,7 @@ async fn request_control_lease(
     Path(session_id): Path<String>,
     Json(request): Json<RequestControlLease>,
 ) -> ApiResult<(StatusCode, Json<ControlLease>)> {
+    ensure_command_dispatch_available(state.simulated_control_enabled)?;
     let mut catalog = state.catalog.write().await;
     let session = catalog
         .live_sessions
@@ -54,6 +55,7 @@ async fn request_control_lease(
             "Control requires an active following LiveSession.",
         ));
     }
+    ensure_session_source_is_control_safe(&mut catalog, &session)?;
     ensure_session_control_scope(&catalog, &session)?;
     let device = catalog
         .devices
@@ -136,6 +138,7 @@ async fn send_command(
     Path(session_id): Path<String>,
     Json(request): Json<SendCommandRequest>,
 ) -> ApiResult<(StatusCode, Json<CommandReceipt>)> {
+    ensure_command_dispatch_available(state.simulated_control_enabled)?;
     if request.command_type.trim().is_empty() || request.idempotency_key.trim().is_empty() {
         return Err(ApiError::bad_request(
             "commandType and idempotencyKey are required.",
@@ -169,6 +172,7 @@ async fn send_command(
             "Commands require an active following LiveSession.",
         ));
     }
+    ensure_session_source_is_control_safe(&mut catalog, &session)?;
     ensure_session_control_scope(&catalog, &session)?;
     if request
         .live_session_id
@@ -269,7 +273,22 @@ fn ensure_device_can_be_controlled(
     Ok(())
 }
 
+fn ensure_command_dispatch_available(simulated_control_enabled: bool) -> ApiResult<()> {
+    if simulated_control_enabled {
+        Ok(())
+    } else {
+        Err(ApiError::unavailable(
+            "Actuator command dispatch is not configured; simulated control is disabled.",
+        ))
+    }
+}
+
 fn ensure_session_control_scope(catalog: &Catalog, session: &LiveSession) -> ApiResult<()> {
+    let uses_observation_only_edge = catalog
+        .devices
+        .get(&session.device_id)
+        .and_then(|device| catalog.integrations.get(&device.integration_id))
+        .is_some_and(|integration| integration.kind == "rms_edge");
     let has_control_assignment = catalog.device_assignments.values().any(|assignment| {
         assignment.project_id == session.project_id
             && assignment.device_id == session.device_id
@@ -281,13 +300,44 @@ fn ensure_session_control_scope(catalog: &Catalog, session: &LiveSession) -> Api
             && assignment.data_source_id == session.data_source_id
             && assignment.valid_to.is_none()
     });
-    if !has_control_assignment || !has_data_assignment {
+    if uses_observation_only_edge {
+        Err(ApiError::conflict(
+            "The RMS Edge Agent adapters are observation-only; actuator command dispatch is not configured.",
+        ))
+    } else if !has_control_assignment || !has_data_assignment {
         Err(ApiError::conflict(
             "LiveSession no longer has a control-capable Project assignment.",
         ))
     } else {
         Ok(())
     }
+}
+
+fn ensure_session_source_is_control_safe(
+    catalog: &mut Catalog,
+    session: &LiveSession,
+) -> ApiResult<()> {
+    let source_is_safe = session.source_health == "fresh"
+        && catalog
+            .data_sources
+            .get(&session.data_source_id)
+            .is_some_and(|source| {
+                source.device_id == session.device_id && source.status == "recording"
+            });
+    if source_is_safe {
+        return Ok(());
+    }
+
+    let lease_count = catalog.leases.len();
+    catalog
+        .leases
+        .retain(|_, lease| lease.live_session_id != session.id);
+    if catalog.leases.len() != lease_count {
+        catalog.bump_version();
+    }
+    Err(ApiError::conflict(
+        "Live source is not fresh and recording; control was revoked.",
+    ))
 }
 
 fn validate_command_times(request: &SendCommandRequest) -> ApiResult<()> {
@@ -305,4 +355,136 @@ fn validate_command_times(request: &SendCommandRequest) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_session(source_health: &str) -> LiveSession {
+        LiveSession {
+            id: "live-session-source-safety".to_owned(),
+            project_id: "project-logistics".to_owned(),
+            device_id: "robot-07".to_owned(),
+            data_source_id: "robot-07-source".to_owned(),
+            opened_by: "operator-01".to_owned(),
+            status: "open".to_owned(),
+            play_state: "following".to_owned(),
+            source_health: source_health.to_owned(),
+            stream_url: "/rerun/live/live-session-source-safety".to_owned(),
+            started_at: "2026-08-20T00:00:00Z".to_owned(),
+            closed_at: None,
+            resource_version: 1,
+        }
+    }
+
+    fn lease(session: &LiveSession) -> ControlLease {
+        ControlLease {
+            id: "lease-source-safety".to_owned(),
+            live_session_id: session.id.clone(),
+            device_id: session.device_id.clone(),
+            holder_id: session.opened_by.clone(),
+            holder_name: "나".to_owned(),
+            expires_at: "2099-08-20T00:00:00Z".to_owned(),
+            epoch: 1,
+            expires_at_ms: i64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn command_fails_closed_and_revokes_lease_when_source_becomes_offline() {
+        let state = AppState::fixture();
+        let session = live_session("fresh");
+        let lease = lease(&session);
+        {
+            let mut catalog = state.catalog.write().await;
+            catalog
+                .live_sessions
+                .insert(session.id.clone(), session.clone());
+            catalog.leases.insert(lease.id.clone(), lease.clone());
+            catalog
+                .data_sources
+                .get_mut(&session.data_source_id)
+                .expect("Fixture source exists")
+                .status = "offline".to_owned();
+        }
+
+        let result = send_command(
+            State(state.clone()),
+            Path(session.id.clone()),
+            Json(SendCommandRequest {
+                live_session_id: Some(session.id.clone()),
+                device_id: session.device_id,
+                command_type: "safe_stop".to_owned(),
+                expected_device_version: 142,
+                idempotency_key: "unsafe-source-command".to_owned(),
+                lease_id: lease.id,
+                lease_epoch: lease.epoch,
+                session_mode: Some("live".to_owned()),
+                issued_at: "2026-08-20T00:00:00Z".to_owned(),
+                expires_at: "2099-08-20T00:00:00Z".to_owned(),
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let catalog = state.catalog.read().await;
+        assert!(
+            catalog
+                .leases
+                .values()
+                .all(|lease| lease.live_session_id != session.id)
+        );
+        assert!(catalog.command_receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_or_removed_sources_revoke_existing_session_leases() {
+        for source_case in ["delayed", "removed"] {
+            let state = AppState::fixture();
+            let session = live_session(if source_case == "delayed" {
+                "delayed"
+            } else {
+                "fresh"
+            });
+            let mut catalog = state.catalog.write().await;
+            catalog
+                .leases
+                .insert("lease-source-safety".to_owned(), lease(&session));
+            if source_case == "removed" {
+                catalog.data_sources.remove(&session.data_source_id);
+            }
+
+            assert!(ensure_session_source_is_control_safe(&mut catalog, &session).is_err());
+            assert!(catalog.leases.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_only_edge_integration_never_accepts_control() {
+        let state = AppState::fixture();
+        let session = live_session("fresh");
+        let mut catalog = state.catalog.write().await;
+        {
+            let integration = catalog
+                .integrations
+                .get_mut("integration-logistics")
+                .expect("fixture integration exists");
+            integration.kind = "rms_edge".to_owned();
+            integration.status = "testing".to_owned();
+        }
+        assert!(ensure_session_control_scope(&catalog, &session).is_err());
+        catalog
+            .integrations
+            .get_mut("integration-logistics")
+            .expect("fixture integration exists")
+            .status = "connected".to_owned();
+        assert!(ensure_session_control_scope(&catalog, &session).is_err());
+    }
+
+    #[test]
+    fn production_control_fails_closed_without_a_dispatcher() {
+        assert!(ensure_command_dispatch_available(false).is_err());
+        assert!(ensure_command_dispatch_available(true).is_ok());
+    }
 }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { createRmsApi } from "./api";
 import { ProductShell } from "./components/ProductShell";
-import { parseRoute, type RmsRoute } from "./routes";
+import { parseRoute, replayPath, type RmsRoute } from "./routes";
 import { IntegrationsWorkspace } from "./workspaces/IntegrationsWorkspace";
 import { ProjectsWorkspace } from "./workspaces/ProjectsWorkspace";
 import { SessionCatalogWorkspace } from "./workspaces/SessionCatalogWorkspace";
@@ -39,7 +39,13 @@ export default function App() {
   switch (route.kind) {
     case "integrations":
       workspace = (
-        <IntegrationsWorkspace api={api} onOpenProjects={() => navigate("/projects")} />
+        <IntegrationsWorkspace
+          api={api}
+          onOpenProjects={() => navigate("/projects")}
+          onOpenReplay={(projectId, recordingId) =>
+            navigate(replayPath(projectId, recordingId))
+          }
+        />
       );
       break;
     case "projects":

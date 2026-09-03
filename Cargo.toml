@@ -91,6 +91,7 @@ re_protos = { path = "crates/store/re_protos", version = "0.36.1", default-featu
 re_query = { path = "crates/store/re_query", version = "0.36.1", default-features = false }
 re_redap_client = { path = "crates/store/re_redap_client", version = "0.36.1", default-features = false }
 re_redap_tests = { path = "crates/store/re_redap_tests", version = "0.36.1", default-features = false }
+rms_import = { path = "crates/store/rms_import", version = "0.36.1", default-features = false }
 re_sdk_types = { path = "crates/store/re_sdk_types", version = "0.36.1", default-features = false }
 re_server = { path = "crates/store/re_server", version = "0.36.1", default-features = false }
 re_sorbet = { path = "crates/store/re_sorbet", version = "0.36.1", default-features = false }
@@ -248,6 +249,7 @@ convert_case = "0.11.0"
 criterion = "0.8.2"
 cros-codecs = "0.0.6"
 crossbeam = "0.8.4"
+csv = "1.4"
 dae-parser = "0.11.0"
 datafusion = { version = "54.0", default-features = false, features = [
   # NOTE: we enable the same features everywhere

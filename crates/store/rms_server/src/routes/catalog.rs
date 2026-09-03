@@ -52,23 +52,27 @@ async fn create_integration(
     validate_required("kind", &request.kind)?;
     validate_required("endpointLabel", &request.endpoint_label)?;
 
-    let mut catalog = state.catalog.write().await;
-    let resource_version = catalog.bump_version();
-    let now = now_iso();
-    let integration = Integration {
-        id: new_id("integration"),
-        organization_id: request.organization_id,
-        name: request.name,
-        kind: request.kind,
-        status: "testing".to_owned(),
-        endpoint_label: request.endpoint_label,
-        last_health_at: now.clone(),
-        created_at: now,
-        resource_version,
-    };
-    catalog
-        .integrations
-        .insert(integration.id.clone(), integration.clone());
+    let integration = state
+        .durable_catalog_mutation(move |catalog| {
+            let resource_version = catalog.bump_version();
+            let now = now_iso();
+            let integration = Integration {
+                id: new_id("integration"),
+                organization_id: request.organization_id,
+                name: request.name,
+                kind: request.kind,
+                status: "testing".to_owned(),
+                endpoint_label: request.endpoint_label,
+                last_health_at: now.clone(),
+                created_at: now,
+                resource_version,
+            };
+            catalog
+                .integrations
+                .insert(integration.id.clone(), integration.clone());
+            Ok(integration)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(integration)))
 }
 
@@ -86,37 +90,41 @@ async fn create_device(
     validate_required("name", &request.name)?;
     validate_required("kind", &request.kind)?;
 
-    let mut catalog = state.catalog.write().await;
-    let integration = catalog
-        .integrations
-        .get(&request.integration_id)
-        .ok_or_else(|| ApiError::not_found("Integration", &request.integration_id))?;
-    if integration.organization_id != request.organization_id {
-        return Err(ApiError::conflict(
-            "Integration and Device must belong to the same organization.",
-        ));
-    }
-    let device_id = request.id.unwrap_or_else(|| new_id("device"));
-    if catalog.devices.contains_key(&device_id) {
-        return Err(ApiError::conflict("Device ID is already registered."));
-    }
-    let device = Device {
-        id: device_id,
-        organization_id: request.organization_id,
-        integration_id: request.integration_id,
-        name: request.name,
-        kind: request.kind,
-        status: request.status,
-        health: request.health,
-        operation_mode: request.operation_mode,
-        battery_percent: request.battery_percent,
-        task_name: request.task_name,
-        task_progress: request.task_progress,
-        last_seen_at: request.last_seen_at.unwrap_or_else(now_iso),
-        state_version: 1,
-    };
-    catalog.devices.insert(device.id.clone(), device.clone());
-    catalog.bump_version();
+    let device = state
+        .durable_catalog_mutation(move |catalog| {
+            let integration = catalog
+                .integrations
+                .get(&request.integration_id)
+                .ok_or_else(|| ApiError::not_found("Integration", &request.integration_id))?;
+            if integration.organization_id != request.organization_id {
+                return Err(ApiError::conflict(
+                    "Integration and Device must belong to the same organization.",
+                ));
+            }
+            let device_id = request.id.unwrap_or_else(|| new_id("device"));
+            if catalog.devices.contains_key(&device_id) {
+                return Err(ApiError::conflict("Device ID is already registered."));
+            }
+            let device = Device {
+                id: device_id,
+                organization_id: request.organization_id,
+                integration_id: request.integration_id,
+                name: request.name,
+                kind: request.kind,
+                status: request.status,
+                health: request.health,
+                operation_mode: request.operation_mode,
+                battery_percent: request.battery_percent,
+                task_name: request.task_name,
+                task_progress: request.task_progress,
+                last_seen_at: request.last_seen_at.unwrap_or_else(now_iso),
+                state_version: 1,
+            };
+            catalog.devices.insert(device.id.clone(), device.clone());
+            catalog.bump_version();
+            Ok(device)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(device)))
 }
 
@@ -148,48 +156,53 @@ async fn create_data_source(
     validate_required("protocol", &request.protocol)?;
     validate_required("liveUrl", &request.live_url)?;
 
-    let mut catalog = state.catalog.write().await;
-    let integration = catalog
-        .integrations
-        .get(&request.integration_id)
-        .ok_or_else(|| ApiError::not_found("Integration", &request.integration_id))?;
-    let device = catalog
-        .devices
-        .get(&request.device_id)
-        .ok_or_else(|| ApiError::not_found("Device", &request.device_id))?;
-    if device.integration_id != integration.id {
-        return Err(ApiError::conflict(
-            "Device and DataSource must use the same Integration.",
-        ));
-    }
-    let source_id = request.id.unwrap_or_else(|| new_id("data-source"));
-    if catalog.data_sources.contains_key(&source_id) {
-        return Err(ApiError::conflict("DataSource ID is already registered."));
-    }
-    let data_source = DataSource {
-        id: source_id,
-        integration_id: request.integration_id,
-        device_id: request.device_id,
-        name: request.name,
-        protocol: request.protocol,
-        status: request.status,
-        live_url: request.live_url,
-        topic_ids: request.topic_ids,
-        mapping_version: 1,
-        last_data_at: request.last_data_at.unwrap_or_else(now_iso),
-    };
-    let topics = topics_for_source(
-        &data_source.id,
-        &data_source.device_id,
-        &data_source.topic_ids,
-    );
-    catalog
-        .topics_by_data_source
-        .insert(data_source.id.clone(), topics);
-    catalog
-        .data_sources
-        .insert(data_source.id.clone(), data_source.clone());
-    catalog.bump_version();
+    let data_source = state
+        .durable_catalog_mutation(move |catalog| {
+            let integration = catalog
+                .integrations
+                .get(&request.integration_id)
+                .ok_or_else(|| ApiError::not_found("Integration", &request.integration_id))?;
+            let device = catalog
+                .devices
+                .get(&request.device_id)
+                .ok_or_else(|| ApiError::not_found("Device", &request.device_id))?;
+            if device.integration_id != integration.id {
+                return Err(ApiError::conflict(
+                    "Device and DataSource must use the same Integration.",
+                ));
+            }
+            let source_id = request.id.unwrap_or_else(|| new_id("data-source"));
+            if catalog.data_sources.contains_key(&source_id) {
+                return Err(ApiError::conflict("DataSource ID is already registered."));
+            }
+            let mut data_source = DataSource {
+                id: source_id,
+                integration_id: request.integration_id,
+                device_id: request.device_id,
+                name: request.name,
+                protocol: request.protocol,
+                status: request.status,
+                live_url: request.live_url,
+                topic_ids: request.topic_ids,
+                mapping_version: 1,
+                last_data_at: request.last_data_at.unwrap_or_else(now_iso),
+            };
+            let topics = topics_for_source(
+                &data_source.id,
+                &data_source.device_id,
+                &data_source.topic_ids,
+            );
+            data_source.topic_ids = topics.iter().map(|topic| topic.id.clone()).collect();
+            catalog
+                .topics_by_data_source
+                .insert(data_source.id.clone(), topics);
+            catalog
+                .data_sources
+                .insert(data_source.id.clone(), data_source.clone());
+            catalog.bump_version();
+            Ok(data_source)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(data_source)))
 }
 

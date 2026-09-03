@@ -1,18 +1,27 @@
 import {
   OPERATOR_ID,
+  type ApproveNetworkCandidateInput,
+  type CandidateVerification,
   type CommandReceipt,
   type ControlLease,
   type DataAssignment,
   type DataSource,
+  type DiscoveryCandidate,
   type Device,
   type DeviceAssignment,
   type Integration,
   type LiveControlCommandRequest,
   type LiveSession,
+  type NetworkDiscoverySession,
+  type NetworkDiscoverySnapshot,
+  type NetworkLinkReceipt,
   type Project,
   type Recording,
+  type RecordingImport,
+  type RecordingImportFormat,
   type ReplaySession,
   type RmsEvent,
+  type TimelineDescriptor,
   type Topic,
   type WorkspaceEvent,
   type WorkspaceSnapshot,
@@ -24,18 +33,55 @@ import type {
   CreateIntegrationInput,
   CreateLiveSessionInput,
   CreateProjectInput,
+  CreateRecordingImportInput,
   CreateReplaySessionInput,
+  DiscoveryApi,
+  DiscoveryRequestOptions,
   IntegrationApi,
   LiveApi,
   ProjectApi,
+  RecordingImportApi,
+  RecordingImportRequestOptions,
+  RecordingImportUploadOptions,
   RegisterDataSourceInput,
   RegisterDeviceInput,
   ReplayApi,
   RmsApi,
+  StartNetworkDiscoveryInput,
 } from "./rmsApi";
 
 const SAMPLE_BASE = "https://app.rerun.io/version/0.36.1/examples";
 const ORGANIZATION_ID = "organization-rms";
+const SAMPLE_CONTENT_SHA256 = "a".repeat(64);
+const SAMPLE_TIMELINES: TimelineDescriptor[] = [
+  {
+    name: "tick",
+    kind: "sequence",
+    start: "0",
+    end: "100",
+    durationSeconds: 50,
+    fps: 2,
+  },
+];
+
+function recordingTimingMetadata(): Pick<
+  Recording,
+  | "timelines"
+  | "defaultTimeline"
+  | "durationSeconds"
+  | "rrdVersion"
+  | "footerVerified"
+  | "contentSha256"
+> {
+  return {
+    timelines: clone(SAMPLE_TIMELINES),
+    defaultTimeline: "tick",
+    durationSeconds: 50,
+    rrdVersion: "0.36.1",
+    footerVerified: true,
+    contentSha256: SAMPLE_CONTENT_SHA256,
+  };
+}
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -49,10 +95,38 @@ function makeId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+function recordingImportFormat(fileName: string): RecordingImportFormat | undefined {
+  const lowerName = fileName.toLowerCase();
+  if (lowerName.endsWith(".rrd")) return "rrd";
+  if (lowerName.endsWith(".mcap")) return "mcap";
+  if (lowerName.endsWith(".zip")) return "ros2-bag-zip";
+  if (lowerName.endsWith(".csv")) return "csv";
+  if (/\.(mp4|mov|webm)$/.test(lowerName)) return "video";
+  return undefined;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("Recording import aborted", "AbortError");
+  }
+}
+
 interface MockRmsApiOptions {
   seed?: boolean;
   latencyMs?: number;
   eventIntervalMs?: number;
+}
+
+interface MockDiscoveryRecord {
+  organizationId: string;
+  session: NetworkDiscoverySession;
+  candidates: DiscoveryCandidate[];
+  revealed: boolean;
+}
+
+interface MockDiscoveryApprovalRecord {
+  input: ApproveNetworkCandidateInput;
+  receipt: NetworkLinkReceipt;
 }
 
 class MockStore {
@@ -64,8 +138,13 @@ class MockStore {
   readonly deviceAssignments = new Map<string, DeviceAssignment>();
   readonly dataAssignments = new Map<string, DataAssignment>();
   readonly topics = new Map<string, Topic[]>();
+  readonly recordingTopics = new Map<string, Topic[]>();
   readonly liveSessions = new Map<string, LiveSession>();
   readonly recordings = new Map<string, Recording>();
+  readonly recordingImports = new Map<string, RecordingImport>();
+  readonly discoverySessions = new Map<string, MockDiscoveryRecord>();
+  readonly discoveryVerifications = new Map<string, CandidateVerification>();
+  readonly discoveryReceipts = new Map<string, MockDiscoveryApprovalRecord>();
   readonly replaySessions = new Map<string, ReplaySession>();
   readonly leases = new Map<string, ControlLease>();
   readonly leaseEpochs = new Map<string, number>();
@@ -84,6 +163,8 @@ export class MockRmsApi implements RmsApi {
   readonly projects: ProjectApi;
   readonly live: LiveApi;
   readonly replay: ReplayApi;
+  readonly recordingImports: RecordingImportApi;
+  readonly discovery: DiscoveryApi;
   readonly control: ControlApi;
 
   private readonly store = new MockStore();
@@ -127,6 +208,25 @@ export class MockRmsApi implements RmsApi {
       createSession: (input) => this.createReplaySession(input),
       getSession: (sessionId) => this.getReplaySession(sessionId),
       closeSession: (sessionId) => this.closeReplaySession(sessionId),
+    };
+    this.recordingImports = {
+      listImports: (projectId) => this.listRecordingImports(projectId),
+      createImport: (input, requestOptions) =>
+        this.createRecordingImport(input, requestOptions),
+      getImport: (importId, requestOptions) =>
+        this.getRecordingImport(importId, requestOptions),
+      cancelImport: (importId) => this.cancelRecordingImport(importId),
+    };
+    this.discovery = {
+      start: (input, requestOptions) =>
+        this.startNetworkDiscovery(input, requestOptions),
+      getSnapshot: (sessionId, requestOptions) =>
+        this.getNetworkDiscoverySnapshot(sessionId, requestOptions),
+      cancel: (sessionId) => this.cancelNetworkDiscovery(sessionId),
+      verify: (sessionId, candidateId, requestOptions) =>
+        this.verifyNetworkCandidate(sessionId, candidateId, requestOptions),
+      approve: (sessionId, candidateId, input, requestOptions) =>
+        this.approveNetworkCandidate(sessionId, candidateId, input, requestOptions),
     };
     this.control = {
       getLease: (liveSessionId) => this.getSessionLease(liveSessionId),
@@ -221,7 +321,7 @@ export class MockRmsApi implements RmsApi {
         "robot-07-source",
         "08:42 경로 이탈",
         "2026-08-20T08:42:10+09:00",
-        "04:18",
+        "00:50",
       ),
       this.fixtureRecording(
         "recording-robot-07-review",
@@ -230,7 +330,7 @@ export class MockRmsApi implements RmsApi {
         "robot-07-source",
         "어제 마지막 운행",
         "2026-08-19T17:14:00+09:00",
-        "21:06",
+        "00:50",
       ),
       this.fixtureRecording(
         "recording-robot-21-review",
@@ -239,7 +339,7 @@ export class MockRmsApi implements RmsApi {
         "robot-21-source",
         "정비 전 운행",
         "2026-08-19T16:20:00+09:00",
-        "10:44",
+        "00:50",
       ),
       this.fixtureRecording(
         "recording-drone-03-review",
@@ -248,9 +348,15 @@ export class MockRmsApi implements RmsApi {
         "drone-03-source",
         "서측 패널 점검",
         "2026-08-19T14:12:00+09:00",
-        "14:32",
+        "00:50",
       ),
-    ].forEach((recording) => this.store.recordings.set(recording.id, recording));
+    ].forEach((recording) => {
+      this.store.recordings.set(recording.id, recording);
+      this.store.recordingTopics.set(
+        recording.id,
+        clone(this.store.topics.get(recording.dataSourceId) ?? []),
+      );
+    });
   }
 
   private fixtureDevice(
@@ -396,6 +502,7 @@ export class MockRmsApi implements RmsApi {
       rrdUrl: `${SAMPLE_BASE}/arkit_scenes.rrd`,
       capturedAt,
       durationLabel,
+      ...recordingTimingMetadata(),
       topicIds: clone(source.topicIds),
       mappingVersion: source.mappingVersion,
       projectSnapshot: {
@@ -556,6 +663,337 @@ export class MockRmsApi implements RmsApi {
     return clone(this.store.topics.get(dataSourceId) ?? []);
   }
 
+  private async startNetworkDiscovery(
+    input: StartNetworkDiscoveryInput,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkDiscoverySession> {
+    throwIfAborted(options.signal);
+    await this.delay();
+    throwIfAborted(options.signal);
+    if (!input.organizationId.trim()) {
+      throw new Error("검색 범위를 확인할 수 없습니다.");
+    }
+    const sessionId = makeId("network-discovery");
+    const startedAt = now();
+    const session: NetworkDiscoverySession = {
+      id: sessionId,
+      status: "searching",
+      candidateCount: 0,
+      startedAt,
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      resourceVersion: 1,
+    };
+    const candidates: DiscoveryCandidate[] = [
+      {
+        id: `${sessionId}-robot`,
+        sessionId,
+        displayName: "Robot-24",
+        category: "robot",
+        status: "found",
+        lastSeenAt: startedAt,
+        sourceCount: 3,
+        supportsLive: true,
+      },
+      {
+        id: `${sessionId}-drone`,
+        sessionId,
+        displayName: "Drone-11",
+        category: "drone",
+        status: "found",
+        lastSeenAt: startedAt,
+        sourceCount: 2,
+        supportsLive: true,
+      },
+      {
+        id: `${sessionId}-gateway`,
+        sessionId,
+        displayName: "현장 게이트웨이",
+        category: "gateway",
+        status: "needs_attention",
+        lastSeenAt: startedAt,
+        sourceCount: 0,
+        supportsLive: false,
+      },
+    ];
+    this.store.discoverySessions.set(sessionId, {
+      organizationId: input.organizationId,
+      session,
+      candidates,
+      revealed: false,
+    });
+    return clone(session);
+  }
+
+  private discoveryRecord(sessionId: string): MockDiscoveryRecord {
+    const record = this.store.discoverySessions.get(sessionId);
+    if (!record) {
+      throw new Error("네트워크 검색을 찾을 수 없습니다.");
+    }
+    if (
+      !["cancelled", "failed", "expired"].includes(record.session.status) &&
+      Date.parse(record.session.expiresAt) <= Date.now()
+    ) {
+      record.session = {
+        ...record.session,
+        status: "expired",
+        resourceVersion: record.session.resourceVersion + 1,
+      };
+    }
+    return record;
+  }
+
+  private activeDiscoveryRecord(sessionId: string): MockDiscoveryRecord {
+    const record = this.discoveryRecord(sessionId);
+    if (record.session.status === "expired") {
+      throw new Error("네트워크 검색 시간이 지났습니다.");
+    }
+    if (record.session.status === "cancelled" || record.session.status === "failed") {
+      throw new Error("현재 검색에서는 요청할 수 없습니다.");
+    }
+    return record;
+  }
+
+  private async getNetworkDiscoverySnapshot(
+    sessionId: string,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkDiscoverySnapshot> {
+    throwIfAborted(options.signal);
+    await this.delay();
+    throwIfAborted(options.signal);
+    const record = this.discoveryRecord(sessionId);
+    if (record.session.status === "searching" && !record.revealed) {
+      record.revealed = true;
+      record.session = {
+        ...record.session,
+        status: "ready",
+        candidateCount: record.candidates.length,
+        resourceVersion: record.session.resourceVersion + 1,
+      };
+    }
+    return clone({
+      session: record.session,
+      candidates: record.revealed ? record.candidates : [],
+    });
+  }
+
+  private async cancelNetworkDiscovery(sessionId: string): Promise<void> {
+    await this.delay();
+    const record = this.store.discoverySessions.get(sessionId);
+    if (!record || ["cancelled", "expired"].includes(record.session.status)) return;
+    record.session = {
+      ...record.session,
+      status: "cancelled",
+      resourceVersion: record.session.resourceVersion + 1,
+    };
+  }
+
+  private async verifyNetworkCandidate(
+    sessionId: string,
+    candidateId: string,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<CandidateVerification> {
+    throwIfAborted(options.signal);
+    await this.delay();
+    throwIfAborted(options.signal);
+    const record = this.activeDiscoveryRecord(sessionId);
+    if (record.session.status !== "ready") {
+      throw new Error("검색이 끝난 뒤 확인해 주세요.");
+    }
+    const candidate = record.candidates.find((item) => item.id === candidateId);
+    if (!candidate) {
+      throw new Error("발견한 장비를 찾을 수 없습니다.");
+    }
+    if (candidate.status === "needs_attention" || candidate.status === "unavailable") {
+      return {
+        verificationToken: makeId("verification"),
+        candidateId,
+        status: candidate.status === "needs_attention" ? "needs_credentials" : "unavailable",
+        suggestedDevice: { name: candidate.displayName, kind: "robot" },
+        sources: [],
+        expiresAt: record.session.expiresAt,
+      };
+    }
+    const sources =
+      candidate.category === "drone"
+        ? [
+            { id: `${candidateId}-spatial`, label: "위치와 자세", category: "spatial" as const, status: "ready" as const },
+            { id: `${candidateId}-telemetry`, label: "비행 상태", category: "telemetry" as const, status: "ready" as const },
+          ]
+        : [
+            { id: `${candidateId}-spatial`, label: "위치와 주변", category: "spatial" as const, status: "ready" as const },
+            { id: `${candidateId}-camera`, label: "전방 카메라", category: "camera" as const, status: "ready" as const },
+            { id: `${candidateId}-telemetry`, label: "운행 상태", category: "telemetry" as const, status: "ready" as const },
+          ];
+    const verification: CandidateVerification = {
+      verificationToken: makeId("verification"),
+      candidateId,
+      status: "verified",
+      suggestedDevice: {
+        name: candidate.displayName,
+        kind: candidate.category === "drone" ? "drone" : "robot",
+      },
+      sources,
+      expiresAt: new Date(
+        Math.min(Date.parse(record.session.expiresAt), Date.now() + 60_000),
+      ).toISOString(),
+    };
+    candidate.status = "verified";
+    record.session.resourceVersion += 1;
+    this.store.discoveryVerifications.set(verification.verificationToken, verification);
+    return clone(verification);
+  }
+
+  private topicIdsForDiscoveredSource(
+    category: CandidateVerification["sources"][number]["category"],
+    deviceKind: Device["kind"],
+  ): string[] {
+    if (category === "camera") return ["front-camera"];
+    if (category === "spatial") return ["pose"];
+    if (category === "telemetry") {
+      return [deviceKind === "drone" ? "altitude" : "velocity", "battery"];
+    }
+    return ["planner"];
+  }
+
+  private async approveNetworkCandidate(
+    sessionId: string,
+    candidateId: string,
+    input: ApproveNetworkCandidateInput,
+    options: DiscoveryRequestOptions = {},
+  ): Promise<NetworkLinkReceipt> {
+    throwIfAborted(options.signal);
+    await this.delay();
+    throwIfAborted(options.signal);
+
+    const previous = this.store.discoveryReceipts.get(input.verificationToken);
+    if (previous) {
+      if (JSON.stringify(previous.input) !== JSON.stringify(input)) {
+        throw new Error("이미 다른 연결에 사용한 확인입니다.");
+      }
+      return clone(previous.receipt);
+    }
+
+    const record = this.activeDiscoveryRecord(sessionId);
+    const candidate = record.candidates.find((item) => item.id === candidateId);
+    const verification = this.store.discoveryVerifications.get(input.verificationToken);
+    const project = this.requireProject(input.projectId);
+    if (!candidate || !verification || verification.candidateId !== candidateId) {
+      throw new Error("연결 확인 정보가 일치하지 않습니다.");
+    }
+    if (Date.parse(verification.expiresAt) <= Date.now()) {
+      throw new Error("연결 확인 시간이 지났습니다.");
+    }
+    if (verification.status !== "verified") {
+      throw new Error("연결할 수 있는 장비가 아닙니다.");
+    }
+    if (project.organizationId !== record.organizationId) {
+      throw new Error("같은 조직의 프로젝트를 선택해 주세요.");
+    }
+    if (input.expectedWorkspaceVersion !== this.store.revision) {
+      throw new Error("프로젝트 상태가 변경되었습니다.");
+    }
+    if (input.accessMode !== "observe" || input.visibility !== "operator") {
+      throw new Error("검색한 장비는 관찰 권한으로만 연결할 수 있습니다.");
+    }
+    const deviceName = input.deviceName.trim();
+    const selectedSourceIds = new Set(input.selectedSourceIds);
+    const selectedSources = verification.sources.filter(
+      (source) => selectedSourceIds.has(source.id) && source.status === "ready",
+    );
+    if (
+      !deviceName ||
+      selectedSources.length === 0 ||
+      selectedSources.length !== selectedSourceIds.size
+    ) {
+      throw new Error("연결할 장비와 데이터를 확인해 주세요.");
+    }
+
+    const revision = this.store.nextRevision();
+    const integration: Integration = {
+      id: makeId("network-integration"),
+      organizationId: record.organizationId,
+      name: `${deviceName} 연동`,
+      kind: "rerun",
+      status: "connected",
+      endpointLabel: "같은 네트워크",
+      lastHealthAt: now(),
+      createdAt: now(),
+      resourceVersion: revision,
+    };
+    const device: Device = {
+      id: makeId("network-device"),
+      organizationId: record.organizationId,
+      integrationId: integration.id,
+      name: deviceName,
+      kind: verification.suggestedDevice.kind,
+      status: "online",
+      health: "unknown",
+      operationMode: "대기",
+      taskName: "할당 없음",
+      taskProgress: 0,
+      lastSeenAt: now(),
+      stateVersion: 1,
+    };
+    const dataSources = selectedSources.map((discoveredSource) => {
+      const topicIds = this.topicIdsForDiscoveredSource(discoveredSource.category, device.kind);
+      return {
+        id: makeId("network-data-source"),
+        integrationId: integration.id,
+        deviceId: device.id,
+        name: discoveredSource.label,
+        protocol: "Rerun",
+        status: "pending" as const,
+        liveUrl: `${SAMPLE_BASE}/arkit_scenes.rrd`,
+        topicIds,
+        mappingVersion: 1,
+        lastDataAt: now(),
+      };
+    });
+    const deviceAssignment: DeviceAssignment = {
+      id: makeId("device-assignment"),
+      projectId: project.id,
+      deviceId: device.id,
+      accessMode: "observe",
+      validFrom: now(),
+      resourceVersion: revision,
+    };
+    const dataAssignments: DataAssignment[] = dataSources.map((source) => ({
+      id: makeId("data-assignment"),
+      projectId: project.id,
+      dataSourceId: source.id,
+      visibility: "operator",
+      validFrom: now(),
+      resourceVersion: revision,
+    }));
+
+    this.store.integrations.set(integration.id, integration);
+    this.store.devices.set(device.id, device);
+    dataSources.forEach((source) => {
+      this.store.dataSources.set(source.id, source);
+      this.store.topics.set(source.id, this.fixtureTopics(source));
+    });
+    this.store.deviceAssignments.set(deviceAssignment.id, deviceAssignment);
+    dataAssignments.forEach((assignment) =>
+      this.store.dataAssignments.set(assignment.id, assignment),
+    );
+    candidate.status = "already_linked";
+    record.session.resourceVersion += 1;
+    const receipt: NetworkLinkReceipt = {
+      status: "linked",
+      projectId: project.id,
+      integrationId: integration.id,
+      deviceId: device.id,
+      dataSourceIds: dataSources.map((source) => source.id),
+      workspaceVersion: revision,
+    };
+    this.store.discoveryReceipts.set(input.verificationToken, {
+      input: clone(input),
+      receipt,
+    });
+    this.emitWorkspace(project.id);
+    return clone(receipt);
+  }
+
   private projectWithCounts(project: Project): Project {
     const assignments = [...this.store.deviceAssignments.values()].filter(
       (assignment) => assignment.projectId === project.id && assignment.validTo == null,
@@ -683,6 +1121,12 @@ export class MockRmsApi implements RmsApi {
     const recordings = [...this.store.recordings.values()].filter(
       (recording) => recording.projectId === projectId,
     );
+    const topicsByRecording = Object.fromEntries(
+      recordings.map((recording) => [
+        recording.id,
+        clone(this.store.recordingTopics.get(recording.id) ?? []),
+      ]),
+    );
     return clone({
       snapshotVersion,
       capturedAt: now(),
@@ -692,6 +1136,7 @@ export class MockRmsApi implements RmsApi {
       devices,
       dataSources,
       recordings,
+      topicsByRecording,
       topicsByDataSource,
     });
   }
@@ -778,6 +1223,7 @@ export class MockRmsApi implements RmsApi {
       rrdUrl: source.liveUrl,
       capturedAt: session.startedAt,
       durationLabel: "방금 종료",
+      ...recordingTimingMetadata(),
       topicIds: clone(source.topicIds),
       mappingVersion: source.mappingVersion,
       projectSnapshot: {
@@ -790,6 +1236,10 @@ export class MockRmsApi implements RmsApi {
       resourceVersion: revision,
     };
     this.store.recordings.set(recording.id, recording);
+    this.store.recordingTopics.set(
+      recording.id,
+      clone(this.store.topics.get(recording.dataSourceId) ?? []),
+    );
     this.stopLiveEventTimer(sessionId);
     this.emitWorkspace(project.id);
     return clone(recording);
@@ -862,6 +1312,180 @@ export class MockRmsApi implements RmsApi {
     }
   }
 
+  private async listRecordingImports(projectId?: string): Promise<RecordingImport[]> {
+    await this.delay();
+    if (projectId) this.requireProject(projectId);
+    return clone(
+      [...this.store.recordingImports.values()].filter(
+        (recordingImport) => !projectId || recordingImport.projectId === projectId,
+      ),
+    );
+  }
+
+  private async createRecordingImport(
+    input: CreateRecordingImportInput,
+    options: RecordingImportUploadOptions = {},
+  ): Promise<RecordingImport> {
+    throwIfAborted(options.signal);
+    options.onProgress?.(0);
+    await this.delay();
+    throwIfAborted(options.signal);
+
+    this.requireProject(input.projectId);
+    const device = this.requireDevice(input.deviceId);
+    this.requireActiveDeviceAssignment(input.projectId, input.deviceId);
+    const assignedSources = [...this.store.dataAssignments.values()]
+      .filter(
+        (assignment) =>
+          assignment.projectId === input.projectId && assignment.validTo == null,
+      )
+      .map((assignment) => this.store.dataSources.get(assignment.dataSourceId))
+      .filter(
+        (source): source is DataSource => source != null && source.deviceId === input.deviceId,
+      );
+    let source = input.dataSourceId
+      ? assignedSources.find((candidate) => candidate.id === input.dataSourceId)
+      : assignedSources.find((candidate) => candidate.protocol.toLowerCase() === "file");
+    if (!source && !input.dataSourceId) {
+      const sourceRevision = this.store.nextRevision();
+      source = {
+        id: `import-source-${input.projectId}-${input.deviceId}`,
+        integrationId: device.integrationId,
+        deviceId: device.id,
+        name: `${device.name} 파일`,
+        protocol: "file",
+        status: "ready",
+        liveUrl: "",
+        topicIds: [],
+        mappingVersion: 1,
+        lastDataAt: now(),
+      };
+      this.store.dataSources.set(source.id, source);
+      this.store.topics.set(source.id, []);
+      const dataAssignment: DataAssignment = {
+        id: makeId("data-assignment"),
+        projectId: input.projectId,
+        dataSourceId: source.id,
+        visibility: "operator",
+        validFrom: now(),
+        resourceVersion: sourceRevision,
+      };
+      this.store.dataAssignments.set(dataAssignment.id, dataAssignment);
+    }
+    if (!source) {
+      throw new Error("가져올 데이터 연결을 하나 선택할 수 없습니다.");
+    }
+    const detectedFormat = recordingImportFormat(input.file.name);
+    if (!detectedFormat || detectedFormat !== input.format) {
+      throw new Error("지원하는 파일 형식이 아닙니다.");
+    }
+    const format = input.format;
+
+    const revision = this.store.nextRevision();
+    const createdAt = now();
+    const recordingImport: RecordingImport = {
+      id: makeId("recording-import"),
+      projectId: input.projectId,
+      deviceId: input.deviceId,
+      dataSourceId: source.id,
+      fileName: input.file.name,
+      format,
+      status: "processing",
+      progressPercent: 0,
+      sizeBytes: input.file.size,
+      artifactUrl: "",
+      createdAt,
+      updatedAt: createdAt,
+      resourceVersion: revision,
+    };
+    recordingImport.artifactUrl = `/api/v1/recording-imports/${encodeURIComponent(recordingImport.id)}/artifact`;
+    this.store.recordingImports.set(recordingImport.id, recordingImport);
+    options.onProgress?.(100);
+    return clone(recordingImport);
+  }
+
+  private async getRecordingImport(
+    importId: string,
+    options: RecordingImportRequestOptions = {},
+  ): Promise<RecordingImport> {
+    throwIfAborted(options.signal);
+    await this.delay();
+    throwIfAborted(options.signal);
+    const recordingImport = this.store.recordingImports.get(importId);
+    if (!recordingImport) {
+      throw new Error("가져오기 작업을 찾을 수 없습니다.");
+    }
+    if (recordingImport.status !== "processing") {
+      return clone(recordingImport);
+    }
+
+    const project = this.requireProject(recordingImport.projectId);
+    const source = this.requireDataSource(recordingImport.dataSourceId);
+    const deviceAssignment = this.requireActiveDeviceAssignment(
+      recordingImport.projectId,
+      recordingImport.deviceId,
+    );
+    const dataAssignment = this.requireActiveDataAssignment(
+      recordingImport.projectId,
+      recordingImport.dataSourceId,
+    );
+    const revision = this.store.nextRevision();
+    const capturedAt = now();
+    const recording: Recording = {
+      id: makeId("recording"),
+      organizationId: project.organizationId,
+      projectId: project.id,
+      deviceId: recordingImport.deviceId,
+      dataSourceId: source.id,
+      name: recordingImport.fileName.replace(/\.[^.]+$/, "") || "가져온 기록",
+      status: "ready",
+      rrdUrl: `${SAMPLE_BASE}/arkit_scenes.rrd`,
+      capturedAt,
+      durationLabel: "00:50",
+      ...recordingTimingMetadata(),
+      topicIds: clone(source.topicIds),
+      mappingVersion: source.mappingVersion,
+      projectSnapshot: {
+        projectId: project.id,
+        projectName: project.name,
+        capturedAt,
+        deviceAssignmentId: deviceAssignment.id,
+        dataAssignmentId: dataAssignment.id,
+      },
+      resourceVersion: revision,
+    };
+    this.store.recordings.set(recording.id, recording);
+    this.store.recordingTopics.set(
+      recording.id,
+      clone(this.store.topics.get(recording.dataSourceId) ?? []),
+    );
+    const readyImport: RecordingImport = {
+      ...recordingImport,
+      status: "ready",
+      progressPercent: 100,
+      sourceSha256: SAMPLE_CONTENT_SHA256,
+      recordingId: recording.id,
+      updatedAt: capturedAt,
+      resourceVersion: revision,
+    };
+    this.store.recordingImports.set(importId, readyImport);
+    this.emitWorkspace(project.id);
+    return clone(readyImport);
+  }
+
+  private async cancelRecordingImport(importId: string): Promise<void> {
+    await this.delay();
+    const recordingImport = this.store.recordingImports.get(importId);
+    if (!recordingImport) return;
+    if (recordingImport.status === "ready" || recordingImport.status === "failed") return;
+    this.store.recordingImports.set(importId, {
+      ...recordingImport,
+      status: "cancelled",
+      updatedAt: now(),
+      resourceVersion: this.store.nextRevision(),
+    });
+  }
+
   private async listRecordings(projectId: string): Promise<Recording[]> {
     await this.delay();
     this.requireProject(projectId);
@@ -881,6 +1505,9 @@ export class MockRmsApi implements RmsApi {
     if (!recording || recording.projectId !== input.projectId || recording.status !== "ready") {
       throw new Error("재생 가능한 기록을 찾을 수 없습니다.");
     }
+    const defaultTimeline = recording.timelines.find(
+      (timeline) => timeline.name === recording.defaultTimeline,
+    );
     const revision = this.store.nextRevision();
     const session: ReplaySession = {
       id: makeId("replay-session"),
@@ -889,6 +1516,14 @@ export class MockRmsApi implements RmsApi {
       status: "open",
       streamUrl: recording.rrdUrl,
       cursorSeconds: 0,
+      initialTimeline: recording.defaultTimeline,
+      initialCursor: {
+        kind: defaultTimeline?.kind ?? "sequence",
+        value: defaultTimeline?.start ?? "0",
+      },
+      initialPlayState: "paused",
+      initialSpeed: 1,
+      initialLoop: { mode: "off" },
       openedAt: now(),
       resourceVersion: revision,
     };
@@ -896,13 +1531,10 @@ export class MockRmsApi implements RmsApi {
     return clone(session);
   }
 
-  private async getReplaySession(sessionId: string): Promise<ReplaySession> {
+  private async getReplaySession(sessionId: string): Promise<ReplaySession | undefined> {
     await this.delay();
     const session = this.store.replaySessions.get(sessionId);
-    if (!session) {
-      throw new Error("Replay 세션을 찾을 수 없습니다.");
-    }
-    return clone(session);
+    return session ? clone(session) : undefined;
   }
 
   private async closeReplaySession(sessionId: string): Promise<void> {
@@ -941,7 +1573,11 @@ export class MockRmsApi implements RmsApi {
     if (device.status !== "online") {
       throw new Error("현재 장비의 제어권을 받을 수 없습니다.");
     }
-    if (device.health === "critical" || device.health === "restricted") {
+    if (
+      device.health === "unknown" ||
+      device.health === "critical" ||
+      device.health === "restricted"
+    ) {
       throw new Error("장비 안전 상태를 먼저 확인해야 합니다.");
     }
     if (device.stateVersion !== expectedDeviceVersion) {

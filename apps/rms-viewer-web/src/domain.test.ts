@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   OPERATOR_ID,
+  deviceKindLabel,
   deriveControlEligibility,
   type ControlEligibilityInput,
   type ControlLease,
@@ -61,6 +62,11 @@ describe("RMS domain boundaries", () => {
   it("keeps integration resources independent from project ownership", () => {
     expect(device).not.toHaveProperty("projectId");
   });
+
+  it("uses user-facing labels for cameras and gateways", () => {
+    expect(deviceKindLabel("camera")).toBe("카메라");
+    expect(deviceKindLabel("gateway")).toBe("게이트웨이");
+  });
 });
 
 describe("deriveControlEligibility", () => {
@@ -97,5 +103,14 @@ describe("deriveControlEligibility", () => {
         input({ lease: { ...lease, expiresAt: new Date(Date.now() - 1_000).toISOString() } }),
       ).reason,
     ).toBe("제어권이 만료되었습니다.");
+  });
+
+  it("fails closed while device health is unknown", () => {
+    expect(
+      deriveControlEligibility(input({ device: { ...device, health: "unknown" } })),
+    ).toEqual({
+      allowed: false,
+      reason: "안전 상태를 먼저 확인해야 합니다.",
+    });
   });
 });

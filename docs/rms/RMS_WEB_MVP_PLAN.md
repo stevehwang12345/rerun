@@ -25,6 +25,7 @@ React host는 canvas, Wasm 부팅, 인증된 RMS API transport만 담당한다.
 - 오른쪽 Topic Panel은 Preset이 선택한 정보만 표시한다.
 - Topic schema, Entity path와 protocol code는 진단 Preset에서만 표시한다.
 - Rerun 기본 Top, Blueprint 및 Selection Panel은 숨긴다.
+- Replay에서는 내장 Time Panel을 29px 축소 상태로 표시하고 전체 Timeline은 사용자가 요청할 때만 펼친다.
 - 로딩과 오류는 기술 상세 대신 한두 줄의 운영자 문구로 덮어쓴다.
 
 ## 데이터 경로
@@ -68,7 +69,8 @@ SSE의 Topic 이벤트는 `data_source_id` 범위로 제한하여 Replay 화면�
 
 ## 현재 제한
 
-Mock LIVE는 공개 RRD를 사용하므로 실제로 증가하는 Stream이 아니다.
-Return-to-live와 실제 Rerun play state 동기화는 `TimeControlCommand`로 연결했지만 재생 속도, 연결 건강과 Blueprint preset은 후속 product seam이 필요하다.
+로컬 LIVE는 footer가 검증된 50초 RRD fixture를 사용하므로 실제로 증가하는 Stream은 아니다.
+Replay의 timeline, cursor, play state, speed와 loop 초기화는 `TimeControlCommand`로 연결되어 있으며 축소 재생 바와 전체 Timeline을 제공한다.
+실제 Redap 연결 건강과 Blueprint preset 생성기는 후속 product seam이 필요하다.
 현재 Rust 장비 선택기는 세 개의 검증용 ID로 제한되며 전체 프로젝트와 장비 목록의 동적 렌더링은 Phase 2 범위다.
 실장비 명령은 구현하지 않았으며 Mock 명령도 Replay, Lease, 장비 상태와 state version 검증을 통과해야 한다.

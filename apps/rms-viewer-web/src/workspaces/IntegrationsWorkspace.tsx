@@ -9,17 +9,47 @@ import type {
   Integration,
   IntegrationKind,
 } from "../domain";
+import { deviceKindLabel } from "../domain";
 import { StatusBadge, WorkspaceState } from "../components/ProductShell";
+import { NetworkDiscoveryEditor } from "./NetworkDiscoveryEditor";
+import { RecordingImportEditor } from "./RecordingImportEditor";
 
 const ORGANIZATION_ID = "org-rms";
 interface IntegrationsWorkspaceProps {
   api: RmsApi;
   onOpenProjects: () => void;
+  onOpenReplay: (projectId: string, recordingId: string) => void;
 }
 
-type Editor = "integration" | "device" | "source" | undefined;
+type Editor = "network" | "integration" | "device" | "source" | "import" | undefined;
 
-export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorkspaceProps) {
+export function integrationKindLabel(kind: IntegrationKind): string {
+  return {
+    ros2: "로봇 데이터",
+    mcap: "파일 데이터",
+    rtsp: "영상",
+    mavlink: "비행 데이터",
+    autoware: "차량 데이터",
+    rerun: "Rerun 데이터",
+    rms_edge: "현장 Edge Agent",
+  }[kind];
+}
+
+export function dataSourceKindLabel(source: DataSource, device?: Device): string {
+  if (source.protocol.trim().toLowerCase() === "file") return "파일 데이터";
+  if (device?.kind === "robot") return "로봇 데이터";
+  if (device?.kind === "drone") return "비행 데이터";
+  if (device?.kind === "vehicle") return "차량 데이터";
+  if (device?.kind === "camera") return "영상";
+  if (source.protocol.toLowerCase().includes("rerun")) return "Rerun 데이터";
+  return "데이터 연결";
+}
+
+export function IntegrationsWorkspace({
+  api,
+  onOpenProjects,
+  onOpenReplay,
+}: IntegrationsWorkspaceProps) {
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [dataSources, setDataSources] = useState<DataSource[]>([]);
@@ -40,7 +70,8 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
       setDevices(nextDevices);
       setDataSources(nextSources);
     } catch (cause: unknown) {
-      setError(cause instanceof Error ? cause.message : "연동 정보를 불러오지 못했습니다.");
+      console.error("Failed to load integrations workspace", cause);
+      setError("연동 정보를 불러오지 못했습니다");
     } finally {
       setLoading(false);
     }
@@ -61,6 +92,12 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
           <h1 id="integrations-title">데이터와 장비 연동</h1>
         </div>
         <div className="workspace__actions">
+          <button type="button" className="button" onClick={() => setEditor("network")}>
+            네트워크에서 찾기…
+          </button>
+          <button type="button" className="button" onClick={() => setEditor("import")}>
+            파일 가져오기…
+          </button>
           <button type="button" className="button" onClick={() => setEditor("integration")}>
             새 연동…
           </button>
@@ -98,7 +135,7 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
               <ResourceRow
                 key={integration.id}
                 title={integration.name}
-                subtitle={`${integration.kind.toUpperCase()} · ${integration.endpointLabel}`}
+                subtitle={integrationKindLabel(integration.kind)}
                 badge={integration.status === "connected" ? "연결됨" : "확인 필요"}
                 tone={integration.status === "connected" ? "normal" : "attention"}
               />
@@ -110,15 +147,18 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
             actionLabel="장비 등록…"
             onAction={() => setEditor("device")}
           >
-            {devices.map((device) => (
-              <ResourceRow
-                key={device.id}
-                title={device.name}
-                subtitle={device.kind === "robot" ? "로봇" : device.kind === "drone" ? "드론" : "차량"}
-                badge={device.status === "online" ? "연결됨" : device.status === "degraded" ? "지연됨" : "연결 끊김"}
-                tone={device.status === "online" ? "normal" : device.status === "degraded" ? "attention" : "restricted"}
-              />
-            ))}
+            {devices.map((device) => {
+              const needsConfirmation = device.health === "unknown";
+              return (
+                <ResourceRow
+                  key={device.id}
+                  title={device.name}
+                  subtitle={deviceKindLabel(device.kind)}
+                  badge={needsConfirmation ? "확인 필요" : device.status === "online" ? "연결됨" : device.status === "degraded" ? "지연됨" : "연결 끊김"}
+                  tone={needsConfirmation ? "attention" : device.status === "online" ? "normal" : device.status === "degraded" ? "attention" : "restricted"}
+                />
+              );
+            })}
           </ResourceColumn>
 
           <ResourceColumn
@@ -130,7 +170,14 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
               <ResourceRow
                 key={source.id}
                 title={source.name}
-                subtitle={`${source.protocol} · mapping v${source.mappingVersion}`}
+                subtitle={
+                  source.status === "pending"
+                    ? "연결 확인 중"
+                    : dataSourceKindLabel(
+                        source,
+                        devices.find((device) => device.id === source.deviceId),
+                      )
+                }
                 badge={source.status === "ready" || source.status === "recording" ? "준비됨" : "확인 필요"}
                 tone={source.status === "ready" || source.status === "recording" ? "normal" : "attention"}
               />
@@ -153,6 +200,22 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
             await refresh();
           }}
         />
+      )}
+      {editor === "network" && (
+        <DialogFrame title="네트워크에서 찾기" onCancel={() => setEditor(undefined)}>
+          <NetworkDiscoveryEditor
+            api={api}
+            organizationId={
+              integrations[0]?.organizationId ?? devices[0]?.organizationId ?? ORGANIZATION_ID
+            }
+            onCancel={() => setEditor(undefined)}
+            onLinked={refresh}
+            onOpenProjects={() => {
+              setEditor(undefined);
+              onOpenProjects();
+            }}
+          />
+        </DialogFrame>
       )}
       {editor === "device" && (
         <DeviceEditor
@@ -206,6 +269,15 @@ export function IntegrationsWorkspace({ api, onOpenProjects }: IntegrationsWorks
             await refresh();
           }}
         />
+      )}
+      {editor === "import" && (
+        <DialogFrame title="파일 가져오기" onCancel={() => setEditor(undefined)}>
+          <RecordingImportEditor
+            api={api}
+            onCancel={() => setEditor(undefined)}
+            onOpenReplay={onOpenReplay}
+          />
+        </DialogFrame>
       )}
     </section>
   );
@@ -291,7 +363,8 @@ function DialogFrame({
 }
 
 function mutationMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : "저장하지 못했습니다";
+  console.error("Failed to update an integration resource", cause);
+  return "저장하지 못했습니다";
 }
 
 function IntegrationEditor({
@@ -352,7 +425,7 @@ function DeviceEditor({
       <form className="form-stack" onSubmit={(event) => { event.preventDefault(); if (!valid || saving) return; setSaving(true); setSubmitError(undefined); void onSubmit(integrationId, name.trim(), kind).catch((cause: unknown) => setSubmitError(mutationMessage(cause))).finally(() => setSaving(false)); }}>
         <label>연동<select value={integrationId} onChange={(event) => setIntegrationId(event.target.value)}>{integrations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label>장비명<input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
-        <label>종류<select value={kind} onChange={(event) => setKind(event.target.value as DeviceKind)}><option value="robot">로봇</option><option value="drone">드론</option><option value="vehicle">차량</option></select></label>
+        <label>종류<select value={kind} onChange={(event) => setKind(event.target.value as DeviceKind)}><option value="robot">로봇</option><option value="drone">드론</option><option value="vehicle">차량</option><option value="camera">카메라</option><option value="gateway">게이트웨이</option></select></label>
         {submitError && <span className="form-error" role="alert">{submitError}</span>}
         <FormActions onCancel={onCancel} saving={saving} valid={Boolean(valid)} />
       </form>

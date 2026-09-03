@@ -121,13 +121,14 @@ Update instructions:
 
 ### SDK/CLI/Wasm top-level crates
 
-| Crate     | Description                          |
-| --------- | ------------------------------------ |
-| rerun-cli | Rerun native CLI binary crate        |
-| Rerun     | Rerun Rust SDK and Viewer shim crate |
-| rerun_c   | Rerun C SDK                          |
-| rerun_py  | Rerun Python SDK                     |
-| re_sdk    | Rerun logging SDK                    |
+| Crate          | Description                                                          |
+| -------------- | -------------------------------------------------------------------- |
+| rerun-cli      | Rerun native CLI binary crate                                        |
+| Rerun          | Rerun Rust SDK and Viewer shim crate                                 |
+| rerun_c        | Rerun C SDK                                                          |
+| rerun_py       | Rerun Python SDK                                                     |
+| re_sdk         | Rerun logging SDK                                                    |
+| rms_edge_agent | Signed, observation-only ROS 2 DDS and MAVLink edge discovery agent |
 
 ### Viewer crates
 
@@ -188,6 +189,7 @@ Update instructions:
 | re_protos            | Rerun remote store gRPC API types                               |
 | re_query             | Querying data in the re_chunk_store                             |
 | re_sdk_types         | The built-in Rerun data types, component types, and archetypes. |
+| rms_import           | Converts supported RMS uploads into atomic, verified RRD data.  |
 | rms_server           | RMS Connect, Projects, Live, Replay, and Live-only Control API. |
 | re_server            | In-memory data server                                           |
 | re_tf                | Dealing with spatial transforms & transform frames              |

@@ -39,6 +39,18 @@ canvas:focus-visible {
   outline-offset: 2px;
 }
 
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
 .product-shell {
   display: grid;
   grid-template-rows: 52px minmax(0, 1fr);
@@ -154,6 +166,8 @@ canvas:focus-visible {
 .workspace__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
 }
 
@@ -596,6 +610,246 @@ select {
   font-size: 0.72rem;
 }
 
+.import-form {
+  gap: 12px;
+}
+
+.import-targets {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.import-dropzone {
+  display: grid;
+  place-items: center;
+  min-height: 112px;
+  padding: 18px;
+  border: 1px dashed #3b4a5d;
+  border-radius: 7px;
+  color: #dfe7f1;
+  background: #0c1117;
+  cursor: pointer;
+  gap: 7px;
+}
+
+.import-dropzone:hover:not(:disabled),
+.import-dropzone:focus-visible {
+  border-color: #5e9dff;
+  background: #101925;
+}
+
+.import-dropzone:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.import-dropzone strong {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 0.8rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-dropzone span,
+.import-placeholder {
+  color: #8390a1;
+  font-size: 0.7rem;
+}
+
+.import-progress {
+  display: grid;
+  gap: 7px;
+}
+
+.import-progress > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #9aa7b8;
+  font-size: 0.72rem;
+}
+
+.import-progress strong {
+  color: #dce6f4;
+  font-variant-numeric: tabular-nums;
+}
+
+.import-progress progress {
+  width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  color: #4d8ce7;
+  background: #202833;
+}
+
+.import-progress progress::-webkit-progress-bar {
+  background: #202833;
+}
+
+.import-progress progress::-webkit-progress-value {
+  background: #4d8ce7;
+}
+
+.import-progress progress::-moz-progress-bar {
+  background: #4d8ce7;
+}
+
+.import-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  padding: 24px;
+  text-align: center;
+  gap: 12px;
+}
+
+.discovery-form {
+  gap: 12px;
+}
+
+.discovery-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  padding: 24px;
+  color: #9aa7b8;
+  text-align: center;
+  gap: 14px;
+}
+
+.discovery-heading,
+.discovery-review__device,
+.discovery-access {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.discovery-heading {
+  min-height: 28px;
+  font-size: 0.78rem;
+}
+
+.discovery-candidates,
+.discovery-sources {
+  display: grid;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  gap: 6px;
+}
+
+.discovery-candidates {
+  max-height: 252px;
+  overflow-y: auto;
+}
+
+.discovery-candidate {
+  display: grid !important;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid #293340;
+  border-radius: 6px;
+  color: #dce6f4 !important;
+  background: #0d131b;
+  cursor: pointer;
+  gap: 10px !important;
+}
+
+.discovery-candidate:has(input:checked) {
+  border-color: #5e9dff;
+  background: #111c29;
+}
+
+.discovery-candidate:has(input:disabled) {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.discovery-candidate input,
+.discovery-sources input {
+  width: 16px;
+  min-height: 16px;
+  margin: 0;
+  accent-color: #5e9dff;
+}
+
+.discovery-candidate__identity {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.discovery-candidate__identity strong {
+  overflow: hidden;
+  color: #e8eef7;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovery-candidate__identity span {
+  color: #8491a2;
+  font-size: 0.68rem;
+}
+
+.discovery-review__device {
+  min-height: 42px;
+  padding: 0 2px 10px;
+  border-bottom: 1px solid #252e39;
+  font-size: 0.82rem;
+}
+
+.discovery-sources legend {
+  margin-bottom: 7px;
+  color: #99a5b5;
+  font-size: 0.72rem;
+}
+
+.discovery-sources label {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  min-height: 42px;
+  padding: 7px 9px;
+  border: 1px solid #293340;
+  border-radius: 5px;
+  color: #dce6f4;
+  cursor: pointer;
+  gap: 9px;
+}
+
+.discovery-sources label > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.discovery-sources small,
+.discovery-access span,
+.form-hint {
+  color: #8491a2;
+  font-size: 0.68rem;
+}
+
+.discovery-access {
+  min-height: 34px;
+  padding: 0 9px;
+  border-radius: 5px;
+  background: #171e27;
+  font-size: 0.72rem;
+}
+
 .viewer-workspace,
 .runtime-host {
   position: relative;
@@ -663,5 +917,20 @@ select {
   .workspace-grid--three,
   .project-layout {
     grid-template-columns: 1fr;
+  }
+
+  .import-targets {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 620px) {
+  .workspace__heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .workspace__actions {
+    justify-content: flex-start;
   }
 }

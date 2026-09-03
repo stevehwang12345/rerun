@@ -1,0 +1,45 @@
+[package]
+name = "rms_edge_agent"
+authors.workspace = true
+description = "Production edge discovery and telemetry agent for RMS"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+atomicwrites = "0.4.4"
+axum.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+parking_lot.workspace = true
+prometheus-client.workspace = true
+ring.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socket2 = "0.6.2"
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+toml = { workspace = true, features = ["display", "parse", "serde"] }
+tower = { workspace = true, features = ["limit", "load-shed", "timeout", "util"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "rms-edge-agent"
+path = "src/main.rs"

@@ -12,7 +12,7 @@ use re_entity_db::entity_db::EntityDb;
 use re_log_channel::{LogReceiverSet, RecordingOpenBehavior, SaveScreenshotError};
 use re_log_types::{ApplicationId, FileSource, RecordingId, StoreId};
 use re_redap_client::ConnectionRegistryHandle;
-use re_sdk_types::blueprint::components::PlayState;
+use re_sdk_types::blueprint::components::{PanelState, PlayState};
 use re_types_core::reflection::ComponentReflectionMap;
 use re_ui::{ContextExt as _, UICommand, UICommandSender as _, notifications};
 use re_viewer_context::open_url::{OpenUrlOptions, ViewerOpenUrl};
@@ -605,6 +605,26 @@ impl App {
         self.active_recording_id()
             .and_then(|store_id| self.state.time_control(store_id))
             .map(re_viewer_context::TimeControl::play_state)
+    }
+
+    /// Sets the runtime override for the recording Time Panel.
+    ///
+    /// Product applications use this to keep a compact, mode-specific shell while retaining the
+    /// built-in Rerun playback controls.
+    pub fn set_time_panel_override(&mut self, state: Option<PanelState>) {
+        let override_was_inactive = state.is_some() && !self.panel_state_overrides_active;
+        if self.panel_state_overrides.time != state || override_was_inactive {
+            self.panel_state_overrides.time = state;
+            self.panel_state_overrides_active |= state.is_some();
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    /// Returns the active runtime override for the recording Time Panel.
+    pub fn time_panel_override(&self) -> Option<PanelState> {
+        self.panel_state_overrides_active
+            .then_some(self.panel_state_overrides.time)
+            .flatten()
     }
 
     /// Whether the active recording was loaded from `url`.
